@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: chaoskey
+    name: burn-chat
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn chat:app --workers 2 --bind 0.0.0.0:$PORT --timeout 60
