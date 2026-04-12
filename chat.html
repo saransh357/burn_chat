@@ -237,47 +237,76 @@
         renderMessages();
     }
 
-    async function sendMessage(){
-        const inp = document.getElementById('compose-input');
-        const txt = inp.value.trim();
-        if(!txt || !apiKey) return;
-        inp.value = '';
+    // Replace your existing sendMessage and add this polling logic
+async function sendMessage() {
+    const inp = document.getElementById('compose-input');
+    const txt = inp.value.trim();
+    if (!txt || !activeContact || !apiKey) return;
+    inp.value = '';
 
-        const {ok, data} = await apiFetch('/v1/encrypt', {
+    // 1. Encrypt via your app_final_project API
+    const {ok, data} = await apiFetch('/v1/encrypt', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + apiKey },
+        body: JSON.stringify({ plaintext: txt })
+    });
+
+    if (ok) {
+        const payload = {
+            from: myEmail,
+            plaintext: txt,
+            ciphertext: data.ciphertext,
+            nonce: data.nonce,
+            encryption_key: data.encryption_key
+        };
+
+        // 2. Send the encrypted bundle to the CHAT database
+        await fetch('/api/send', {
             method: 'POST',
-            headers: { Authorization: 'Bearer ' + apiKey },
-            body: JSON.stringify({ plaintext: txt })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sender: myEmail,
+                recipient: activeContact,
+                payload: payload
+            })
         });
+        loadMessages(); // Refresh UI
+    }
+}
 
-        if(ok) {
-            const msg = { from: myEmail, plaintext: txt, ciphertext: data.ciphertext, ts: new Date().toISOString() };
-            conversations[activeContact].push(msg);
-            renderMessages();
-            // Mock receiving the same encrypted data back for verification
-            setTimeout(() => simulateReceive(data, txt), 500);
+// Automatically check for new messages every 3 seconds
+async function loadMessages() {
+    if (!activeContact) return;
+    
+    const r = await fetch(`/api/get_messages?user=${myEmail}&contact=${activeContact}`);
+    const rows = await r.json();
+    
+    // Decrypt messages for display
+    const decodedMsgs = await Promise.all(rows.map(async (row) => {
+        const p = JSON.parse(row.payload);
+        
+        // If it's from the other person, we need to decrypt it
+        if (p.from !== myEmail) {
+            const {ok, data} = await apiFetch('/v1/decrypt', {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + apiKey },
+                body: JSON.stringify({
+                    ciphertext: p.ciphertext,
+                    nonce: p.nonce,
+                    encryption_key: p.encryption_key
+                })
+            });
+            return { ...p, plaintext: ok ? data.plaintext : "[Decryption Failed]", ts: row.timestamp };
         }
-    }
+        return { ...p, ts: row.timestamp };
+    }));
 
-    function simulateReceive(encrypted, originalPlaintext){
-        const reply = { from: activeContact, plaintext: "[verified] " + originalPlaintext, ciphertext: encrypted.ciphertext, ts: new Date().toISOString() };
-        conversations[activeContact].push(reply);
-        renderMessages();
-    }
+    conversations[activeContact] = decodedMsgs;
+    renderMessages();
+}
 
-    function renderMessages(){
-        const area = document.getElementById('messages-area');
-        const msgs = conversations[activeContact] || [];
-        area.innerHTML = msgs.map(m => `
-            <div class="msg-wrap ${m.from === myEmail ? 'mine' : 'theirs'}">
-                <div class="bubble">${m.plaintext}</div>
-                <div class="msg-meta">
-                    ${new Date(m.ts).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
-                    <span class="ciphertext-hint" title="${m.ciphertext}">🔒 AES-GCM</span>
-                </div>
-            </div>
-        `).join('');
-        area.scrollTop = area.scrollHeight;
-    }
+// Start the auto-refresh timer
+setInterval(loadMessages, 3000);
 
     function doLogout() { location.reload(); }
 </script>
