@@ -1,448 +1,406 @@
 
 <style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:transparent}
-.shell{display:flex;height:600px;border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden;background:var(--color-background-primary)}
-.sidebar{width:220px;border-right:0.5px solid var(--color-border-tertiary);display:flex;flex-direction:column;flex-shrink:0;background:var(--color-background-secondary)}
-.sidebar-top{padding:14px 12px 10px;border-bottom:0.5px solid var(--color-border-tertiary)}
-.app-name{font-size:13px;font-weight:500;color:var(--color-text-primary);display:flex;align-items:center;gap:8px}
-.fire-dot{width:10px;height:10px;border-radius:50%;background:#e24b4a;flex-shrink:0}
-.key-bar{margin-top:8px;padding:6px 8px;background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);cursor:pointer}
-.key-bar-label{font-size:10px;color:var(--color-text-tertiary);margin-bottom:3px}
-.key-bar-val{font-size:11px;font-family:var(--font-mono);color:var(--color-text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.timer-row{display:flex;align-items:center;gap:6px;margin-top:8px}
-.timer-track{flex:1;height:2px;background:var(--color-border-tertiary);border-radius:2px;overflow:hidden}
-.timer-fill{height:100%;background:#639922;border-radius:2px;transition:width 1s linear}
-.timer-fill.mid{background:#ba7517}
-.timer-fill.low{background:#e24b4a}
-.timer-text{font-size:10px;font-family:var(--font-mono);color:var(--color-text-secondary);min-width:22px;text-align:right}
-.contacts{flex:1;overflow-y:auto;padding:6px}
-.contact-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:var(--border-radius-md);cursor:pointer;transition:background .15s}
-.contact-item:hover,.contact-item.active{background:var(--color-background-primary)}
-.avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:500;flex-shrink:0}
-.av-a{background:#EEEDFE;color:#3C3489}
-.av-b{background:#E1F5EE;color:#085041}
-.av-c{background:#FAEEDA;color:#633806}
-.contact-name{font-size:13px;color:var(--color-text-primary);font-weight:500}
-.contact-sub{font-size:11px;color:var(--color-text-secondary)}
-.new-contact-btn{margin:6px;padding:7px;border:0.5px dashed var(--color-border-secondary);border-radius:var(--border-radius-md);background:none;color:var(--color-text-secondary);font-size:12px;cursor:pointer;width:calc(100% - 12px);text-align:center;transition:background .15s}
-.new-contact-btn:hover{background:var(--color-background-primary)}
-.chat-area{flex:1;display:flex;flex-direction:column;min-width:0}
-.chat-header{padding:12px 16px;border-bottom:0.5px solid var(--color-border-tertiary);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.chat-header-left{display:flex;align-items:center;gap:10px}
-.chat-header-name{font-size:14px;font-weight:500;color:var(--color-text-primary)}
-.chat-header-sub{font-size:11px;color:var(--color-text-secondary)}
-.enc-badge{font-size:10px;padding:2px 7px;border-radius:100px;background:#EAF3DE;color:#27500A;border:0.5px solid #97C459;font-family:var(--font-mono)}
-.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
-.msg-row{display:flex;gap:8px;align-items:flex-end}
-.msg-row.mine{flex-direction:row-reverse}
-.msg-avatar{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:500;flex-shrink:0}
-.bubble{max-width:68%;padding:8px 12px;border-radius:14px;font-size:13px;line-height:1.5;position:relative}
-.bubble.theirs{background:var(--color-background-secondary);color:var(--color-text-primary);border-radius:4px 14px 14px 14px}
-.bubble.mine{background:#534AB7;color:#EEEDFE;border-radius:14px 4px 14px 14px}
-.bubble-time{font-size:10px;margin-top:3px;opacity:0.6}
-.bubble-enc-indicator{display:flex;align-items:center;gap:4px;font-size:10px;margin-top:4px;font-family:var(--font-mono)}
-.enc-dot{width:5px;height:5px;border-radius:50%;background:#639922;flex-shrink:0}
-.enc-dot.expired{background:#e24b4a}
-.burn-notice{text-align:center;font-size:11px;color:var(--color-text-tertiary);padding:4px 10px;background:var(--color-background-secondary);border-radius:100px;border:0.5px solid var(--color-border-tertiary);margin:4px auto;font-family:var(--font-mono)}
-.input-area{padding:12px 16px;border-top:0.5px solid var(--color-border-tertiary);display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
-.input-area textarea{flex:1;resize:none;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-lg);padding:8px 12px;font-size:13px;font-family:system-ui,sans-serif;background:var(--color-background-secondary);color:var(--color-text-primary);outline:none;line-height:1.5;max-height:80px;overflow-y:auto}
-.input-area textarea:focus{border-color:var(--color-border-primary)}
-.send-btn{width:36px;height:36px;border-radius:50%;border:none;background:#534AB7;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px;transition:opacity .15s}
-.send-btn:hover{opacity:0.85}
-.send-btn:disabled{opacity:0.4;cursor:not-allowed}
-.empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--color-text-tertiary);font-size:13px;gap:6px}
-.setup-overlay{position:absolute;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:10;border-radius:var(--border-radius-lg)}
-.setup-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);padding:20px 24px;width:340px}
-.setup-card h3{font-size:15px;font-weight:500;color:var(--color-text-primary);margin-bottom:4px}
-.setup-card p{font-size:12px;color:var(--color-text-secondary);margin-bottom:16px;line-height:1.5}
-.setup-field{margin-bottom:10px}
-.setup-field label{font-size:11px;color:var(--color-text-secondary);display:block;margin-bottom:4px}
-.setup-field input{width:100%;padding:7px 10px;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);background:var(--color-background-secondary);color:var(--color-text-primary);font-size:12px;font-family:var(--font-mono);outline:none}
-.setup-field input:focus{border-color:var(--color-border-primary)}
-.setup-actions{display:flex;gap:8px;margin-top:14px}
-.btn-save{flex:1;padding:8px;background:#534AB7;color:#fff;border:none;border-radius:var(--border-radius-md);font-size:13px;font-weight:500;cursor:pointer}
-.btn-cancel{padding:8px 14px;background:none;color:var(--color-text-secondary);border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);font-size:13px;cursor:pointer}
-.add-contact-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);padding:20px 24px;width:320px}
-.add-contact-card h3{font-size:15px;font-weight:500;color:var(--color-text-primary);margin-bottom:12px}
-.status-dot{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:4px}
-.status-ok{background:#639922}
-.status-err{background:#e24b4a}
-.cfg-btn{padding:4px 8px;background:none;border:0.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);font-size:11px;color:var(--color-text-secondary);cursor:pointer;transition:background .15s}
-.cfg-btn:hover{background:var(--color-background-secondary)}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:var(--color-background-primary);
+  --bg2:var(--color-background-secondary);
+  --bg3:var(--color-background-tertiary);
+  --border:var(--color-border-tertiary);
+  --border2:var(--color-border-secondary);
+  --txt:var(--color-text-primary);
+  --txt2:var(--color-text-secondary);
+  --txt3:var(--color-text-tertiary);
+  --info-bg:var(--color-background-info);
+  --info-txt:var(--color-text-info);
+  --success-bg:var(--color-background-success);
+  --success-txt:var(--color-text-success);
+  --danger-bg:var(--color-background-danger);
+  --danger-txt:var(--color-text-danger);
+  --r:var(--border-radius-md);
+  --rl:var(--border-radius-lg);
+}
+body{font-family:var(--font-sans);font-size:14px;color:var(--txt);background:var(--bg3);min-height:520px}
+
+/* ── auth screen ── */
+#auth-screen{display:flex;align-items:center;justify-content:center;min-height:520px;padding:2rem}
+.auth-card{background:var(--bg);border:0.5px solid var(--border2);border-radius:var(--rl);padding:2rem;width:100%;max-width:360px}
+.auth-card h2{font-size:16px;font-weight:500;margin-bottom:4px}
+.auth-card p{font-size:13px;color:var(--txt2);margin-bottom:1.5rem}
+.auth-card label{display:block;font-size:12px;color:var(--txt2);margin-bottom:4px;margin-top:12px}
+.auth-card input{width:100%;padding:8px 10px;border:0.5px solid var(--border2);border-radius:var(--r);background:var(--bg2);color:var(--txt);font-size:14px;outline:none}
+.auth-card input:focus{border-color:var(--color-border-primary)}
+.auth-card .field-row{display:flex;align-items:center;gap:8px;position:relative}
+.auth-card .field-row input{flex:1}
+.btn-primary{margin-top:1.25rem;width:100%;padding:9px;background:var(--txt);color:var(--bg);border:none;border-radius:var(--r);font-size:14px;font-weight:500;cursor:pointer}
+.btn-primary:hover{opacity:.85}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.auth-err{margin-top:.75rem;font-size:13px;color:var(--danger-txt);background:var(--danger-bg);border-radius:var(--r);padding:8px 10px;display:none}
+.base-url-row{display:flex;gap:6px;margin-bottom:1rem}
+.base-url-row input{flex:1;padding:6px 8px;border:0.5px solid var(--border);border-radius:var(--r);background:var(--bg2);color:var(--txt);font-size:12px}
+.base-url-row span{font-size:11px;color:var(--txt3);align-self:center;white-space:nowrap}
+
+/* ── chat app ── */
+#chat-screen{display:none;height:520px;background:var(--bg);border:0.5px solid var(--border2);border-radius:var(--rl);overflow:hidden;flex-direction:row}
+.sidebar{width:220px;border-right:0.5px solid var(--border);display:flex;flex-direction:column;background:var(--bg2)}
+.sidebar-header{padding:14px 14px 10px;border-bottom:0.5px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.sidebar-header .me{font-size:13px;font-weight:500;color:var(--txt)}
+.sidebar-header .tier-badge{font-size:10px;padding:2px 7px;border-radius:20px;background:var(--info-bg);color:var(--info-txt)}
+.sidebar-header .logout-btn{font-size:11px;color:var(--txt3);background:none;border:none;cursor:pointer;padding:0}
+.sidebar-header .logout-btn:hover{color:var(--txt)}
+.contacts-label{font-size:10px;color:var(--txt3);padding:10px 14px 4px;text-transform:uppercase;letter-spacing:.05em}
+.contact-list{flex:1;overflow-y:auto}
+.contact-item{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;border-bottom:0.5px solid var(--border)}
+.contact-item:hover,.contact-item.active{background:var(--bg)}
+.contact-avatar{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:500;flex-shrink:0}
+.contact-info{flex:1;min-width:0}
+.contact-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.contact-preview{font-size:11px;color:var(--txt3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.add-contact-row{padding:10px 14px;border-top:0.5px solid var(--border)}
+.add-contact-row input{width:100%;padding:6px 8px;font-size:12px;border:0.5px solid var(--border2);border-radius:var(--r);background:var(--bg);color:var(--txt);outline:none}
+.add-contact-row input:focus{border-color:var(--color-border-primary)}
+.add-contact-btn{margin-top:5px;width:100%;padding:5px;font-size:12px;background:none;border:0.5px solid var(--border2);border-radius:var(--r);color:var(--txt2);cursor:pointer}
+.add-contact-btn:hover{background:var(--bg3)}
+
+/* ── chat panel ── */
+.chat-panel{flex:1;display:flex;flex-direction:column;min-width:0}
+.chat-header{padding:12px 16px;border-bottom:0.5px solid var(--border);display:flex;align-items:center;gap:10px;background:var(--bg)}
+.chat-header .avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:500;flex-shrink:0}
+.chat-header-info{flex:1}
+.chat-header-name{font-size:14px;font-weight:500}
+.chat-header-sub{font-size:11px;color:var(--txt3)}
+.enc-badge{font-size:10px;padding:2px 8px;border-radius:20px;background:var(--success-bg);color:var(--success-txt)}
+.empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--txt3);gap:8px}
+.empty-state .icon{font-size:24px}
+.empty-state p{font-size:13px}
+.messages-area{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:10px;background:var(--bg3)}
+.msg-wrap{display:flex;flex-direction:column;max-width:72%;gap:2px}
+.msg-wrap.mine{align-self:flex-end;align-items:flex-end}
+.msg-wrap.theirs{align-self:flex-start;align-items:flex-start}
+.msg-sender{font-size:11px;color:var(--txt3);padding:0 4px}
+.msg-bubble{padding:8px 12px;border-radius:14px;font-size:13px;line-height:1.5;word-break:break-word}
+.msg-wrap.mine .msg-bubble{background:var(--txt);color:var(--bg);border-bottom-right-radius:4px}
+.msg-wrap.theirs .msg-bubble{background:var(--bg);border:0.5px solid var(--border);color:var(--txt);border-bottom-left-radius:4px}
+.msg-meta{display:flex;align-items:center;gap:6px;padding:0 4px}
+.msg-time{font-size:10px;color:var(--txt3)}
+.enc-tick{font-size:9px;color:var(--success-txt);background:var(--success-bg);padding:1px 5px;border-radius:10px}
+.msg-enc-detail{font-size:10px;color:var(--txt3);padding:0 4px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;cursor:pointer}
+.msg-enc-detail:hover{color:var(--info-txt)}
+.compose-area{padding:10px 14px;border-top:0.5px solid var(--border);display:flex;gap:8px;align-items:flex-end;background:var(--bg)}
+.compose-area textarea{flex:1;resize:none;padding:8px 11px;border:0.5px solid var(--border2);border-radius:var(--r);font-size:13px;font-family:var(--font-sans);color:var(--txt);background:var(--bg2);outline:none;max-height:96px;line-height:1.4}
+.compose-area textarea:focus{border-color:var(--color-border-primary)}
+.send-btn{padding:8px 14px;background:var(--txt);color:var(--bg);border:none;border-radius:var(--r);font-size:13px;font-weight:500;cursor:pointer;flex-shrink:0;align-self:flex-end}
+.send-btn:disabled{opacity:.4;cursor:not-allowed}
+.send-btn:hover:not(:disabled){opacity:.85}
+.toast{position:absolute;bottom:16px;right:16px;background:var(--bg);border:0.5px solid var(--border2);border-radius:var(--r);padding:8px 12px;font-size:12px;color:var(--txt2);box-shadow:none;display:none;max-width:240px}
+.no-contact-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--txt3);text-align:center;padding:2rem;gap:8px}
+.no-contact-state p{font-size:13px}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border2);border-top-color:var(--txt);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
-<h2 class="sr-only">Burn After Reading — encrypted chat app powered by ChaosKey rotating entropy keys</h2>
-<div style="position:relative">
-<div class="shell" id="shell">
 
-  <div class="sidebar">
-    <div class="sidebar-top">
-      <div class="app-name">
-        <div class="fire-dot"></div>
-        BurnChat
-      </div>
-      <div class="key-bar" onclick="openSetup()" title="Click to configure">
-        <div class="key-bar-label">server &amp; key</div>
-        <div class="key-bar-val" id="key-preview">click to configure →</div>
-      </div>
-      <div class="timer-row">
-        <div class="timer-track"><div class="timer-fill" id="timer-fill"></div></div>
-        <span class="timer-text" id="timer-text">10s</span>
-      </div>
+<h2 class="sr-only">ChaosKey encrypted chat — login and send end-to-end encrypted messages</h2>
+
+<div id="auth-screen">
+  <div class="auth-card">
+    <h2>ChaosKey Chat</h2>
+    <p>End-to-end encrypted · powered by your CryptoAPI</p>
+    <div class="base-url-row">
+      <input id="base-url" type="text" value="https://your-app.onrender.com" placeholder="https://your-api.com" />
+      <span>API base</span>
     </div>
-    <div class="contacts" id="contacts-list"></div>
-    <button class="new-contact-btn" onclick="openAddContact()">+ add contact</button>
+    <label>Email</label>
+    <input id="login-email" type="email" placeholder="you@example.com" autocomplete="email" />
+    <label>Password</label>
+    <div class="field-row">
+      <input id="login-pw" type="password" placeholder="••••••••" autocomplete="current-password" />
+    </div>
+    <div class="auth-err" id="auth-err"></div>
+    <button class="btn-primary" id="login-btn" onclick="doLogin()">Log in</button>
+    <p style="margin-top:10px;font-size:12px;color:var(--txt3);text-align:center">Don't have an account? Register at your ChaosKey dashboard first.</p>
   </div>
+</div>
 
-  <div class="chat-area">
-    <div class="chat-header" id="chat-header" style="display:none">
-      <div class="chat-header-left">
-        <div class="avatar" id="chat-avatar" style="width:28px;height:28px;font-size:11px"></div>
-        <div>
-          <div class="chat-header-name" id="chat-name"></div>
-          <div class="chat-header-sub" id="chat-sub"></div>
+<div id="chat-screen" style="display:none;flex-direction:row">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <div>
+        <div class="me" id="sidebar-name">—</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:2px">
+          <div class="tier-badge" id="sidebar-tier">free</div>
+          <div style="font-size:10px;color:var(--txt3)" id="sidebar-quota"></div>
         </div>
       </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <span class="enc-badge">E2E encrypted</span>
-        <button class="cfg-btn" onclick="openSetup()">settings</button>
-      </div>
+      <button class="logout-btn" onclick="doLogout()">sign out</button>
     </div>
-    <div id="messages" class="messages">
-      <div class="empty-state" id="empty-state">
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-tertiary)" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        <span>Select a contact to start chatting</span>
-        <span style="font-size:11px">Messages burn after the key rotates</span>
-      </div>
+    <div class="contacts-label">Conversations</div>
+    <div class="contact-list" id="contact-list"></div>
+    <div class="add-contact-row">
+      <input id="new-contact-input" type="text" placeholder="Add contact (email)" onkeydown="if(event.key==='Enter')addContact()" />
+      <button class="add-contact-btn" onclick="addContact()">+ Add</button>
     </div>
-    <div class="input-area" id="input-area" style="display:none">
-      <textarea id="msg-input" rows="1" placeholder="Type a secret message…" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
-      <button class="send-btn" id="send-btn" onclick="sendMessage()" title="Encrypt &amp; send">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-      </button>
+  </div>
+  <div class="chat-panel" id="chat-panel">
+    <div class="no-contact-state" id="no-contact-state">
+      <div style="font-size:24px">💬</div>
+      <p>Add a contact and start an encrypted conversation.</p>
+    </div>
+    <div id="active-chat" style="display:none;flex-direction:column;height:100%;flex:1">
+      <div class="chat-header">
+        <div class="avatar" id="ch-avatar" style="background:var(--info-bg);color:var(--info-txt)">?</div>
+        <div class="chat-header-info">
+          <div class="chat-header-name" id="ch-name">—</div>
+          <div class="chat-header-sub" id="ch-sub">—</div>
+        </div>
+        <div class="enc-badge">AES-256-GCM</div>
+      </div>
+      <div class="messages-area" id="messages-area"></div>
+      <div class="compose-area">
+        <textarea id="compose-input" rows="1" placeholder="Type a message… (Enter to send)" onkeydown="handleComposeKey(event)" oninput="autoResize(this)"></textarea>
+        <button class="send-btn" id="send-btn" onclick="sendMessage()">Send</button>
+      </div>
     </div>
   </div>
 </div>
 
-<div class="setup-overlay" id="setup-overlay">
-  <div class="setup-card">
-    <h3>Connect to ChaosKey</h3>
-    <p>Enter your server URL and API key to enable end-to-end encrypted messaging.</p>
-    <div class="setup-field">
-      <label>Server URL</label>
-      <input type="text" id="cfg-server" placeholder="https://your-app.onrender.com">
-    </div>
-    <div class="setup-field">
-      <label>API key</label>
-      <input type="text" id="cfg-key" placeholder="ck_live_…">
-    </div>
-    <div class="setup-field">
-      <label>Your name</label>
-      <input type="text" id="cfg-name" placeholder="Alice">
-    </div>
-    <div id="cfg-status" style="font-size:11px;color:var(--color-text-secondary);min-height:14px;margin-top:4px"></div>
-    <div class="setup-actions">
-      <button class="btn-cancel" onclick="closeSetup()">cancel</button>
-      <button class="btn-save" onclick="saveSetup()">save &amp; connect</button>
-    </div>
-  </div>
-</div>
-
-<div class="setup-overlay" id="add-contact-overlay" style="display:none">
-  <div class="add-contact-card">
-    <h3>Add contact</h3>
-    <div class="setup-field">
-      <label>Name</label>
-      <input type="text" id="nc-name" placeholder="Bob">
-    </div>
-    <div id="nc-status" style="font-size:11px;color:var(--color-text-secondary);min-height:14px;margin-top:4px"></div>
-    <div class="setup-actions">
-      <button class="btn-cancel" onclick="closeAddContact()">cancel</button>
-      <button class="btn-save" onclick="addContact()">add</button>
-    </div>
-  </div>
-</div>
-</div>
+<div class="toast" id="toast"></div>
 
 <script>
-const AVATAR_COLORS = [
-  {bg:'#EEEDFE',color:'#3C3489'},
-  {bg:'#E1F5EE',color:'#085041'},
-  {bg:'#FAEEDA',color:'#633806'},
-  {bg:'#FBEAF0',color:'#72243E'},
-  {bg:'#E6F1FB',color:'#0C447C'},
-];
-
-let cfg = JSON.parse(localStorage.getItem('bc_cfg') || '{"server":"","key":"","name":"You"}');
-let contacts = JSON.parse(localStorage.getItem('bc_contacts') || '[]');
-let threads = JSON.parse(localStorage.getItem('bc_threads') || '{}');
+let API_BASE = '';
+let apiKey = '';
+let myEmail = '';
+let myName = '';
+let myTier = 'free';
+let myQuota = 100;
+let contacts = [];
+let conversations = {};
 let activeContact = null;
+const COLORS = [
+  {bg:'#E6F1FB',txt:'#0C447C'},{bg:'#EAF3DE',txt:'#27500A'},
+  {bg:'#EEEDFE',txt:'#3C3489'},{bg:'#FBEAF0',txt:'#72243E'},
+  {bg:'#FAEEDA',txt:'#633806'},{bg:'#E1F5EE',txt:'#085041'}
+];
+function colorFor(email){const h=email.split('').reduce((a,c)=>a+c.charCodeAt(0),0);return COLORS[h%COLORS.length]}
+function initials(email){const n=email.split('@')[0];return n.slice(0,2).toUpperCase()}
+function fmtTime(ts){const d=new Date(ts);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
+function showToast(msg,dur=2500){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(()=>t.style.display='none',dur)}
+function autoResize(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,96)+'px'}
 
-function saveAll() {
-  localStorage.setItem('bc_cfg', JSON.stringify(cfg));
-  localStorage.setItem('bc_contacts', JSON.stringify(contacts));
-  localStorage.setItem('bc_threads', JSON.stringify(threads));
+async function apiFetch(path,opts={}){
+  const url=API_BASE.replace(/\/+$/,'')+path;
+  try{
+    const r=await fetch(url,{...opts,headers:{...(opts.headers||{}),'Content-Type':'application/json'}});
+    const ct=r.headers.get('Content-Type')||'';
+    let data;
+    if(ct.includes('json')){data=await r.json()}else{const t=await r.text();data={error:'Non-JSON: '+t.slice(0,80)}}
+    return{ok:r.ok,status:r.status,data};
+  }catch(e){return{ok:false,status:0,data:{error:e.message}}}
 }
 
-function initials(name) {
-  return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0,2);
+async function doLogin(){
+  const btn=document.getElementById('login-btn');
+  const errEl=document.getElementById('auth-err');
+  API_BASE=document.getElementById('base-url').value.trim();
+  const email=document.getElementById('login-email').value.trim().toLowerCase();
+  const pw=document.getElementById('login-pw').value;
+  errEl.style.display='none';
+  if(!API_BASE||!email||!pw){errEl.textContent='Please fill in all fields.';errEl.style.display='block';return}
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Logging in…';
+  const{ok,data}=await apiFetch('/v1/login',{method:'POST',body:JSON.stringify({email,password:pw})});
+  if(!ok){errEl.textContent=data.error||'Login failed';errEl.style.display='block';btn.disabled=false;btn.textContent='Log in';return}
+  myEmail=email;
+  myName=data.name||email.split('@')[0];
+  myTier=data.tier||'free';
+  myQuota=data.quota||100;
+  apiKey='__NEEDS_ROTATE__';
+  document.getElementById('auth-screen').style.display='none';
+  const cs=document.getElementById('chat-screen');
+  cs.style.display='flex';
+  document.getElementById('sidebar-name').textContent=myName;
+  document.getElementById('sidebar-tier').textContent=myTier;
+  document.getElementById('sidebar-quota').textContent=myTier==='admin'?'∞':(myQuota+'/day');
+  showToast('Logged in. Rotating key to retrieve API key…');
+  await rotateKeyForSession(email,pw);
 }
 
-function avatarStyle(idx) {
-  const c = AVATAR_COLORS[idx % AVATAR_COLORS.length];
-  return `background:${c.bg};color:${c.color}`;
+async function rotateKeyForSession(email,pw){
+  const{ok,data}=await apiFetch('/v1/rotate_key',{method:'POST',body:JSON.stringify({email,password:pw})});
+  if(ok&&data.api_key){
+    apiKey=data.api_key;
+    showToast('API key ready — E2E encryption active.');
+    renderContacts();
+  }else{
+    showToast('Warning: could not retrieve API key. Encryption may fail. '+( data.error||''));
+  }
 }
 
-function renderContacts() {
-  const list = document.getElementById('contacts-list');
-  list.innerHTML = '';
-  contacts.forEach((c, i) => {
-    const msgs = threads[c.id] || [];
-    const last = msgs[msgs.length-1];
-    const div = document.createElement('div');
-    div.className = 'contact-item' + (activeContact && activeContact.id === c.id ? ' active' : '');
-    div.innerHTML = `
-      <div class="avatar" style="${avatarStyle(i)}">${initials(c.name)}</div>
-      <div style="min-width:0">
-        <div class="contact-name">${c.name}</div>
-        <div class="contact-sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${last ? (last.mine ? 'You: ' : '') + '[encrypted]' : 'no messages yet'}</div>
+function doLogout(){
+  apiKey='';myEmail='';myName='';contacts=[];conversations={};activeContact=null;
+  document.getElementById('chat-screen').style.display='none';
+  document.getElementById('auth-screen').style.display='flex';
+  document.getElementById('login-pw').value='';
+  document.getElementById('auth-err').style.display='none';
+  document.getElementById('login-btn').disabled=false;
+  document.getElementById('login-btn').textContent='Log in';
+  document.getElementById('contact-list').innerHTML='';
+  document.getElementById('messages-area').innerHTML='';
+}
+
+function addContact(){
+  const inp=document.getElementById('new-contact-input');
+  const email=inp.value.trim().toLowerCase();
+  if(!email||!email.includes('@')){showToast('Enter a valid email.');return}
+  if(email===myEmail){showToast("That's your own email.");return}
+  if(contacts.find(c=>c.email===email)){showToast('Already added.');return}
+  contacts.push({email,name:email.split('@')[0]});
+  conversations[email]=[];
+  inp.value='';
+  renderContacts();
+}
+
+function renderContacts(){
+  const list=document.getElementById('contact-list');
+  list.innerHTML='';
+  if(contacts.length===0){
+    list.innerHTML='<div style="padding:16px 14px;font-size:12px;color:var(--txt3)">No contacts yet</div>';
+    return;
+  }
+  contacts.forEach(c=>{
+    const msgs=conversations[c.email]||[];
+    const last=msgs[msgs.length-1];
+    const cl=colorFor(c.email);
+    const div=document.createElement('div');
+    div.className='contact-item'+(activeContact===c.email?' active':'');
+    div.onclick=()=>openConversation(c.email);
+    div.innerHTML=`
+      <div class="contact-avatar" style="background:${cl.bg};color:${cl.txt}">${initials(c.email)}</div>
+      <div class="contact-info">
+        <div class="contact-name">${c.name||c.email.split('@')[0]}</div>
+        <div class="contact-preview">${last?'🔒 '+last.plaintext.slice(0,28)+'…':'No messages yet'}</div>
       </div>`;
-    div.onclick = () => selectContact(c, i);
     list.appendChild(div);
   });
 }
 
-function selectContact(contact, idx) {
-  activeContact = contact;
+function openConversation(email){
+  activeContact=email;
   renderContacts();
-  document.getElementById('chat-header').style.display = 'flex';
-  document.getElementById('input-area').style.display = 'flex';
-  document.getElementById('empty-state').style.display = 'none';
-  const av = document.getElementById('chat-avatar');
-  av.textContent = initials(contact.name);
-  av.style.cssText = avatarStyle(idx) + ';width:28px;height:28px;font-size:11px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:500;flex-shrink:0';
-  document.getElementById('chat-name').textContent = contact.name;
-  document.getElementById('chat-sub').textContent = 'Messages self-destruct on key rotation';
+  document.getElementById('no-contact-state').style.display='none';
+  const ac=document.getElementById('active-chat');
+  ac.style.display='flex';
+  const cl=colorFor(email);
+  const av=document.getElementById('ch-avatar');
+  av.textContent=initials(email);
+  av.style.background=cl.bg;
+  av.style.color=cl.txt;
+  document.getElementById('ch-name').textContent=email.split('@')[0];
+  document.getElementById('ch-sub').textContent=email;
   renderMessages();
-  setTimeout(() => {
-    const m = document.getElementById('messages');
-    m.scrollTop = m.scrollHeight;
-  }, 50);
-  document.getElementById('msg-input').focus();
+  document.getElementById('compose-input').focus();
 }
 
-function renderMessages() {
-  const container = document.getElementById('messages');
-  const msgs = threads[activeContact.id] || [];
-  container.innerHTML = '';
-  if (msgs.length === 0) {
-    container.innerHTML = `<div style="text-align:center;font-size:12px;color:var(--color-text-tertiary);margin:auto;padding:20px 0">Send your first encrypted message to ${activeContact.name}</div>`;
+function renderMessages(){
+  const area=document.getElementById('messages-area');
+  area.innerHTML='';
+  const msgs=(conversations[activeContact]||[]);
+  if(msgs.length===0){
+    area.innerHTML='<div style="text-align:center;padding:2rem;font-size:12px;color:var(--txt3)">No messages yet — say hello!</div>';
     return;
   }
-  const myName = cfg.name || 'You';
-  msgs.forEach((msg, i) => {
-    if (msg.type === 'notice') {
-      const n = document.createElement('div');
-      n.className = 'burn-notice';
-      n.textContent = msg.text;
-      container.appendChild(n);
-      return;
-    }
-    const row = document.createElement('div');
-    row.className = 'msg-row' + (msg.mine ? ' mine' : '');
-    const ci = contacts.findIndex(c => c.id === activeContact.id);
-    const avStyle = msg.mine ? 'background:#534AB7;color:#EEEDFE' : avatarStyle(ci);
-    const avInitials = msg.mine ? initials(myName) : initials(activeContact.name);
-    const timeStr = new Date(msg.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-    const keyExpired = (Date.now() - msg.ts) > 10000;
-    row.innerHTML = `
-      <div class="msg-avatar" style="${avStyle}">${avInitials}</div>
-      <div>
-        <div class="bubble ${msg.mine ? 'mine' : 'theirs'}">
-          ${msg.plaintext ? escHtml(msg.plaintext) : '<em style="opacity:0.6">decrypted</em>'}
-          <div class="bubble-time">${timeStr}</div>
-          <div class="bubble-enc-indicator">
-            <div class="enc-dot ${keyExpired ? 'expired' : ''}"></div>
-            <span style="opacity:0.6;font-size:10px;font-family:var(--font-mono)">${keyExpired ? 'key rotated' : 'encrypted'}</span>
-          </div>
-        </div>
-      </div>`;
-    container.appendChild(row);
+  msgs.forEach(m=>{
+    const mine=m.from===myEmail;
+    const wrap=document.createElement('div');
+    wrap.className='msg-wrap '+(mine?'mine':'theirs');
+    const preview=m.ciphertext?m.ciphertext.slice(0,28)+'…':'';
+    wrap.innerHTML=`
+      <div class="msg-sender">${mine?'You':m.from.split('@')[0]}</div>
+      <div class="msg-bubble">${escHtml(m.plaintext)}</div>
+      <div class="msg-meta">
+        <span class="msg-time">${fmtTime(m.ts)}</span>
+        <span class="enc-tick">encrypted</span>
+      </div>
+      ${preview?`<div class="msg-enc-detail" title="Click to see ciphertext" onclick="showCipher(${JSON.stringify(m.ciphertext)})">${preview}</div>`:''}`;
+    area.appendChild(wrap);
   });
-  container.scrollTop = container.scrollHeight;
+  area.scrollTop=area.scrollHeight;
 }
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function showCipher(ct){showToast('Ciphertext: '+ct.slice(0,60)+'…',4000)}
+
+function handleComposeKey(e){
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}
 }
 
-function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-}
+async function sendMessage(){
+  if(!activeContact){showToast('Select a conversation first.');return}
+  if(!apiKey||apiKey==='__NEEDS_ROTATE__'){showToast('API key not ready yet — please wait.');return}
+  const inp=document.getElementById('compose-input');
+  const txt=inp.value.trim();
+  if(!txt)return;
+  const btn=document.getElementById('send-btn');
+  btn.disabled=true;
+  inp.value='';inp.style.height='auto';
 
-function autoResize(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 80) + 'px';
-}
-
-async function apiFetch(path, opts) {
-  if (!cfg.server) return { ok: false, data: { error: 'No server configured' }};
-  if (!cfg.key)    return { ok: false, data: { error: 'No API key configured' }};
-  try {
-    const r = await fetch(cfg.server.replace(/\/$/, '') + path, opts);
-    let data;
-    try { data = await r.json(); } catch(e) { data = { error: 'Non-JSON response' }; }
-    return { ok: r.ok, data };
-  } catch(e) {
-    return { ok: false, data: { error: 'Cannot reach server' }};
-  }
-}
-
-async function sendMessage() {
-  const input = document.getElementById('msg-input');
-  const text = input.value.trim();
-  if (!text || !activeContact) return;
-  const btn = document.getElementById('send-btn');
-  btn.disabled = true;
-  input.disabled = true;
-
-  const { ok, data } = await apiFetch('/v1/encrypt', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + cfg.key, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ plaintext: text })
+  const{ok,data}=await apiFetch('/v1/encrypt',{
+    method:'POST',
+    headers:{Authorization:'Bearer '+apiKey},
+    body:JSON.stringify({plaintext:txt})
   });
 
-  if (ok) {
-    if (!threads[activeContact.id]) threads[activeContact.id] = [];
-    threads[activeContact.id].push({
-      mine: true,
-      plaintext: text,
-      ciphertext: data.ciphertext,
-      nonce: data.nonce,
-      encryption_key: data.encryption_key,
-      ts: Date.now()
-    });
-    input.value = '';
-    input.style.height = 'auto';
-    saveAll();
-    renderContacts();
-    renderMessages();
-  } else {
-    showToast('Encryption failed: ' + (data.error || 'unknown error'));
+  if(!ok){
+    showToast('Encrypt failed: '+(data.error||'unknown error'));
+    btn.disabled=false;inp.value=txt;
+    return;
   }
-  btn.disabled = false;
-  input.disabled = false;
-  input.focus();
-}
 
-function showToast(msg) {
-  const t = document.createElement('div');
-  t.style.cssText = 'position:absolute;bottom:60px;left:50%;transform:translateX(-50%);background:#e24b4a;color:#fff;font-size:12px;padding:6px 14px;border-radius:100px;z-index:20;white-space:nowrap';
-  t.textContent = msg;
-  document.querySelector('[style="position:relative"]').appendChild(t);
-  setTimeout(() => t.remove(), 3000);
-}
+  const encryptedPayload=data;
+  const msg={
+    id:Date.now(),
+    from:myEmail,
+    to:activeContact,
+    plaintext:txt,
+    ciphertext:encryptedPayload.ciphertext,
+    nonce:encryptedPayload.nonce,
+    encryption_key:encryptedPayload.encryption_key,
+    ts:new Date().toISOString()
+  };
 
-function openSetup() {
-  document.getElementById('cfg-server').value = cfg.server || '';
-  document.getElementById('cfg-key').value = cfg.key || '';
-  document.getElementById('cfg-name').value = cfg.name || '';
-  document.getElementById('setup-overlay').style.display = 'flex';
-  document.getElementById('cfg-status').textContent = '';
-}
+  if(!conversations[activeContact])conversations[activeContact]=[];
+  conversations[activeContact].push(msg);
 
-function closeSetup() {
-  if (cfg.server && cfg.key) document.getElementById('setup-overlay').style.display = 'none';
-}
+  await simulateReceive(msg);
 
-async function saveSetup() {
-  const server = document.getElementById('cfg-server').value.trim().replace(/\/$/, '');
-  const key    = document.getElementById('cfg-key').value.trim();
-  const name   = document.getElementById('cfg-name').value.trim() || 'You';
-  const st = document.getElementById('cfg-status');
-  if (!server || !key) { st.innerHTML = '<span class="status-dot status-err"></span>Server and API key required'; return; }
-  st.innerHTML = '<span class="status-dot" style="background:#ba7517"></span>Connecting…';
-  cfg = { server, key, name };
-  saveAll();
-  const { ok } = await apiFetch('/v1/usage', { headers: { 'Authorization': 'Bearer ' + key }});
-  if (ok) {
-    st.innerHTML = '<span class="status-dot status-ok"></span>Connected!';
-    updateKeyPreview();
-    setTimeout(() => document.getElementById('setup-overlay').style.display = 'none', 800);
-  } else {
-    st.innerHTML = '<span class="status-dot status-err"></span>Could not connect — check server URL and key';
-  }
-}
-
-function updateKeyPreview() {
-  const el = document.getElementById('key-preview');
-  if (cfg.key) {
-    el.textContent = cfg.key.slice(0, 16) + '…';
-    el.style.color = 'var(--color-text-primary)';
-  } else {
-    el.textContent = 'click to configure →';
-    el.style.color = 'var(--color-text-secondary)';
-  }
-}
-
-function openAddContact() {
-  document.getElementById('nc-name').value = '';
-  document.getElementById('nc-status').textContent = '';
-  document.getElementById('add-contact-overlay').style.display = 'flex';
-  setTimeout(() => document.getElementById('nc-name').focus(), 50);
-}
-
-function closeAddContact() {
-  document.getElementById('add-contact-overlay').style.display = 'none';
-}
-
-function addContact() {
-  const name = document.getElementById('nc-name').value.trim();
-  const st = document.getElementById('nc-status');
-  if (!name) { st.textContent = 'Enter a name'; return; }
-  const id = 'c_' + Date.now();
-  contacts.push({ id, name });
-  saveAll();
+  renderMessages();
   renderContacts();
-  closeAddContact();
-  const idx = contacts.length - 1;
-  selectContact(contacts[idx], idx);
+  btn.disabled=false;
+  document.getElementById('compose-input').focus();
 }
 
-let timerSec = 10;
-function tickTimer() {
-  timerSec--;
-  if (timerSec <= 0) {
-    timerSec = 10;
-    if (activeContact) renderMessages();
-  }
-  const pct = (timerSec / 10) * 100;
-  const fill = document.getElementById('timer-fill');
-  fill.style.width = pct + '%';
-  fill.className = 'timer-fill' + (timerSec <= 3 ? ' low' : timerSec <= 6 ? ' mid' : '');
-  document.getElementById('timer-text').textContent = timerSec + 's';
+async function simulateReceive(sentMsg){
+  if(!conversations[activeContact])conversations[activeContact]=[];
+  const{ok,data}=await apiFetch('/v1/decrypt',{
+    method:'POST',
+    headers:{Authorization:'Bearer '+apiKey},
+    body:JSON.stringify({
+      ciphertext:sentMsg.ciphertext,
+      nonce:sentMsg.nonce,
+      encryption_key:sentMsg.encryption_key
+    })
+  });
+  const decrypted=ok?data.plaintext:('[decrypt error: '+(data.error||'?')+']');
+  const reply={
+    id:Date.now()+1,
+    from:activeContact,
+    to:myEmail,
+    plaintext:'[received & verified] '+decrypted,
+    ciphertext:sentMsg.ciphertext,
+    nonce:sentMsg.nonce,
+    encryption_key:sentMsg.encryption_key,
+    ts:new Date(Date.now()+200).toISOString()
+  };
+  conversations[activeContact].push(reply);
 }
-const startSec = 10 - (Math.floor(Date.now() / 1000) % 10);
-timerSec = startSec;
-document.getElementById('timer-fill').style.width = (startSec / 10 * 100) + '%';
-setInterval(tickTimer, 1000);
 
-if (cfg.server && cfg.key) {
-  updateKeyPreview();
-  document.getElementById('setup-overlay').style.display = 'none';
-}
-renderContacts();
-
-if (contacts.length === 0) {
-  contacts = [
-    { id: 'demo_alice', name: 'Alice' },
-    { id: 'demo_bob',   name: 'Bob'   },
-  ];
-  threads['demo_alice'] = [
-    { mine: false, plaintext: 'Hey! Did you set up the server yet?', ts: Date.now() - 45000 },
-    { mine: true,  plaintext: 'Almost — just need to paste the API key.', ts: Date.now() - 30000 },
-    { type: 'notice', text: 'key rotated — messages above are locked' },
-  ];
-  renderContacts();
-}
+document.getElementById('login-pw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
 </script>
