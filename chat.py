@@ -48,6 +48,7 @@ import sqlite3
 # ── Config ────────────────────────────────────────────────────────────────────
 CHAOSKEY_URL = os.getenv("CHAOSKEY_URL", "").rstrip("/")
 SECRET_KEY   = os.getenv("SECRET_KEY", secrets.token_hex(32))
+DB_PATH      = os.getenv("DB_PATH", "burnchat.db")
 PORT         = int(os.getenv("PORT", 5000))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
