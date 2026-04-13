@@ -1,23 +1,23 @@
 """
-CryptoAPI — Key Issuance & Encryption-as-a-Service
-+ BurnChat Message Relay
-====================================================
-- PostgreSQL support via DATABASE_URL (Neon serverless compatible)
-- SQLite fallback for local development
-- Admin tier with unlimited quota + special admin endpoints
-- Admin account seeded automatically from env vars on first boot
-- Daily quota removed for admin tier
-- Passwords: bcrypt with fallback to sha256
-- BurnChat: /api/send, /api/get_messages, /api/delete_messages, /api/inbox
-- BurnChat UI served at /chat
+BurnChat — Encrypted Ephemeral Messenger
+=========================================
+Standalone product. Uses ChaosKey API for AES-256-GCM encryption.
+Messages are encrypted at rest; threads can be permanently burned.
+
+Environment Variables:
+  CHAOSKEY_URL      URL of your ChaosKey instance (e.g. https://your-app.onrender.com)
+  CHAOSKEY_API_KEY  A valid ChaosKey API key (ck_live_…) used server-side for crypto
+  SECRET_KEY        Flask session secret (random string, keep safe)
+  DB_PATH           SQLite database file path (default: burnchat.db)
+  PORT              Port to listen on (default: 5000)
 """
 
-import os, secrets, hashlib, hmac, time, logging, json
+import os, secrets, hashlib, hmac, time, logging, json, requests
 from datetime import datetime, timezone
 from functools import wraps
 
-import requests
-from flask import Flask, request, jsonify, g, abort, render_template_string
+from flask import (Flask, request, jsonify, g, session,
+                   render_template_string, redirect, abort)
 from flask_cors import CORS
 
 # ── bcrypt ────────────────────────────────────────────────────────────────────
@@ -25,8 +25,8 @@ try:
     import bcrypt as _bcrypt
     def hash_password(pw: str) -> str:
         return _bcrypt.hashpw(pw.encode(), _bcrypt.gensalt(12)).decode()
-    def check_password(pw: str, hashed: str) -> bool:
-        return _bcrypt.checkpw(pw.encode(), hashed.encode())
+    def check_password(pw: str, h: str) -> bool:
+        return _bcrypt.checkpw(pw.encode(), h.encode())
 except ImportError:
     import hashlib as _hl
     def hash_password(pw: str) -> str:
@@ -40,1323 +40,1269 @@ except ImportError:
         except Exception:
             return False
 
+import sqlite3
+
 # ── Config ────────────────────────────────────────────────────────────────────
-RELAY_TOKEN       = os.getenv("RELAY_TOKEN", "")
-ADMIN_SECRET      = os.getenv("ADMIN_SECRET", "")
-DATABASE_URL      = os.getenv("DATABASE_URL", "")
-DB_PATH           = os.getenv("DB_PATH", "chaoskey.db")
-DYNAMIC_RELAY_URL = os.getenv("RELAY_URL", "")
-
-ADMIN_EMAIL       = os.getenv("ADMIN_EMAIL", "admin@admin.com")
-ADMIN_PASSWORD    = os.getenv("ADMIN_PASSWORD", "")
-
-FREE_QUOTA_DAY  = 100
-PRO_QUOTA_DAY   = 10_000
-ADMIN_QUOTA_DAY = 999_999_999
-KEY_PREFIX      = "ck_live_"
+CHAOSKEY_URL     = os.getenv("CHAOSKEY_URL", "").rstrip("/")
+CHAOSKEY_API_KEY = os.getenv("CHAOSKEY_API_KEY", "")
+SECRET_KEY       = os.getenv("SECRET_KEY", secrets.token_hex(32))
+DB_PATH          = os.getenv("DB_PATH", "burnchat.db")
+PORT             = int(os.getenv("PORT", 5000))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("CryptoAPI")
+log = logging.getLogger("BurnChat")
 
-if not RELAY_TOKEN:
-    log.warning("RELAY_TOKEN env var not set — bridge authentication disabled.")
-if not ADMIN_SECRET:
-    log.warning("ADMIN_SECRET env var not set — admin endpoints are unprotected!")
+if not CHAOSKEY_URL:
+    log.warning("CHAOSKEY_URL not set — encryption will fail. Set it to your ChaosKey instance URL.")
+if not CHAOSKEY_API_KEY:
+    log.warning("CHAOSKEY_API_KEY not set — encryption will fail. Generate a key from ChaosKey.")
 
-app = Flask("CryptoAPI")
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
-
-# ── Database abstraction (PostgreSQL or SQLite) ───────────────────────────────
-USE_POSTGRES = bool(DATABASE_URL)
-
-if USE_POSTGRES:
-    import psycopg2
-    import psycopg2.extras
-
-    def _make_conn():
-        url = DATABASE_URL
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(url)
-
-    def get_db():
-        if "db" not in g:
-            g.db = _make_conn()
-            g.db.autocommit = False
-        return g.db
-
-    @app.teardown_appcontext
-    def close_db(exc):
-        db = g.pop("db", None)
-        if db:
-            if exc:
-                db.rollback()
-            else:
-                db.commit()
-            db.close()
-
-    def db_execute(sql, params=()):
-        sql = sql.replace("?", "%s")
-        cur = get_db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql, params)
-        return cur
-
-    def db_lastrowid(cur):
-        cur.execute("SELECT lastval()")
-        return cur.fetchone()["lastval"]
-
-    def db_commit():
-        get_db().commit()
-
-    AUTOINCREMENT = "SERIAL PRIMARY KEY"
-
-else:
-    import sqlite3
-
-    def get_db():
-        if "db" not in g:
-            g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-            g.db.row_factory = sqlite3.Row
-            g.db.execute("PRAGMA journal_mode=WAL")
-        return g.db
-
-    @app.teardown_appcontext
-    def close_db(exc):
-        db = g.pop("db", None)
-        if db:
-            db.close()
-
-    def db_execute(sql, params=()):
-        return get_db().execute(sql, params)
-
-    def db_lastrowid(cur):
-        return cur.lastrowid
-
-    def db_commit():
-        get_db().commit()
-
-    AUTOINCREMENT = "INTEGER PRIMARY KEY AUTOINCREMENT"
+app = Flask("BurnChat")
+app.secret_key = SECRET_KEY
+CORS(app, supports_credentials=True)
 
 
-# ── Schema ────────────────────────────────────────────────────────────────────
-def get_schema():
-    ai = AUTOINCREMENT
-    return f"""
-CREATE TABLE IF NOT EXISTS customers (
-    id            {ai},
-    email         TEXT UNIQUE NOT NULL,
-    name          TEXT NOT NULL,
-    tier          TEXT NOT NULL DEFAULT 'free',
-    created_at    TEXT NOT NULL,
-    active        INTEGER NOT NULL DEFAULT 1,
-    password_hash TEXT
+# ── Database ──────────────────────────────────────────────────────────────────
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA foreign_keys=ON")
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc):
+    db = g.pop("db", None)
+    if db:
+        db.close()
+
+def db_exec(sql, params=()):
+    return get_db().execute(sql, params)
+
+def db_commit():
+    get_db().commit()
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    email        TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    avatar_color TEXT NOT NULL DEFAULT '#ff6b35'
 );
-CREATE TABLE IF NOT EXISTS api_keys (
-    id          {ai},
-    customer_id INTEGER NOT NULL REFERENCES customers(id),
-    key_hash    TEXT UNIQUE NOT NULL,
-    key_prefix  TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    revoked_at  TEXT,
-    label       TEXT DEFAULT 'default'
+CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender       TEXT NOT NULL,
+    recipient    TEXT NOT NULL,
+    ciphertext   TEXT NOT NULL,
+    nonce        TEXT NOT NULL,
+    enc_key      TEXT NOT NULL,
+    plaintext    TEXT,
+    sent_at      TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS usage_log (
-    id          {ai},
-    key_id      INTEGER NOT NULL REFERENCES api_keys(id),
-    endpoint    TEXT NOT NULL,
-    ts          TEXT NOT NULL,
-    status      INTEGER NOT NULL,
-    latency_ms  INTEGER
-);
-CREATE TABLE IF NOT EXISTS daily_counts (
-    key_id  INTEGER NOT NULL REFERENCES api_keys(id),
-    day     TEXT NOT NULL,
-    count   INTEGER NOT NULL DEFAULT 0,
-    {"UNIQUE(key_id, day)" if USE_POSTGRES else "PRIMARY KEY (key_id, day)"}
-);
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id          {ai},
-    sender      TEXT NOT NULL,
-    recipient   TEXT NOT NULL,
-    payload     TEXT NOT NULL,
-    timestamp   TEXT NOT NULL
-);
+CREATE INDEX IF NOT EXISTS idx_msg_thread
+    ON messages(sender, recipient);
 """
-
 
 def init_db():
     with app.app_context():
-        if USE_POSTGRES:
-            url = DATABASE_URL
-            if url.startswith("postgres://"):
-                url = url.replace("postgres://", "postgresql://", 1)
-            conn = psycopg2.connect(url)
-            conn.autocommit = True
-            cur = conn.cursor()
-            for stmt in get_schema().split(";"):
-                stmt = stmt.strip()
-                if stmt:
-                    try:
-                        cur.execute(stmt)
-                    except Exception as e:
-                        log.warning(f"Schema stmt skipped: {e}")
-            try:
-                cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT")
-            except Exception:
-                pass
-            conn.close()
-        else:
-            db = sqlite3.connect(DB_PATH)
-            db.executescript(get_schema())
-            try:
-                db.execute("ALTER TABLE customers ADD COLUMN password_hash TEXT")
-                db.commit()
-            except Exception:
-                pass
+        db = sqlite3.connect(DB_PATH)
+        db.executescript(SCHEMA)
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN avatar_color TEXT NOT NULL DEFAULT '#ff6b35'")
             db.commit()
-            db.close()
-
-        _seed_admin()
-
-
-def _seed_admin():
-    if not ADMIN_PASSWORD:
-        log.warning("[Init] ADMIN_PASSWORD not set — admin account NOT created.")
-        return
-
-    try:
-        existing = db_execute(
-            "SELECT id FROM customers WHERE email = ?", (ADMIN_EMAIL,)
-        ).fetchone()
-
-        if existing:
-            db_execute(
-                "UPDATE customers SET tier = 'admin', password_hash = ? WHERE email = ?",
-                (hash_password(ADMIN_PASSWORD), ADMIN_EMAIL)
-            )
-            db_commit()
-            log.info(f"[Init] Admin account refreshed: {ADMIN_EMAIL}")
-            return
-
-        pw_hash = hash_password(ADMIN_PASSWORD)
-        db_execute(
-            "INSERT INTO customers (email, name, tier, created_at, password_hash) VALUES (?, ?, 'admin', ?, ?)",
-            (ADMIN_EMAIL, "Admin", now_iso(), pw_hash)
-        )
-        db_commit()
-
-        cust = db_execute("SELECT id FROM customers WHERE email = ?", (ADMIN_EMAIL,)).fetchone()
-        cust_id = cust["id"]
-
-        raw_key, key_hash, prefix = mint_key()
-        db_execute(
-            "INSERT INTO api_keys (customer_id, key_hash, key_prefix, created_at, label) VALUES (?, ?, ?, ?, 'admin')",
-            (cust_id, key_hash, prefix, now_iso())
-        )
-        db_commit()
-        log.info(f"[Init] Admin account created: {ADMIN_EMAIL}")
-        log.info(f"[Init] Admin API key: {raw_key}")
-
-    except Exception as e:
-        log.error(f"[Init] Failed to seed admin: {e}")
+        except Exception:
+            pass
+        db.commit()
+        db.close()
+    log.info("Database ready.")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def mint_key():
-    raw = KEY_PREFIX + secrets.token_urlsafe(32)
-    return raw, hashlib.sha256(raw.encode()).hexdigest(), raw[:16] + "…"
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-def today():   return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-def now_iso(): return datetime.now(timezone.utc).isoformat()
+AVATAR_COLORS = [
+    "#ff6b35", "#f7931e", "#ffcd3c", "#4ecdc4",
+    "#45b7d1", "#a29bfe", "#fd79a8", "#00b894"
+]
 
-def quota_for_tier(tier: str) -> int:
-    return {"free": FREE_QUOTA_DAY, "pro": PRO_QUOTA_DAY, "admin": ADMIN_QUOTA_DAY}.get(tier, FREE_QUOTA_DAY)
+def pick_color(email: str) -> str:
+    return AVATAR_COLORS[sum(ord(c) for c in email) % len(AVATAR_COLORS)]
 
-
-# ── Auth middleware ───────────────────────────────────────────────────────────
-def require_api_key(f):
+def require_login(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return jsonify({"error": "Missing Authorization header"}), 401
-
-        key_hash = hashlib.sha256(auth[7:].encode()).hexdigest()
-        row = db_execute(
-            "SELECT k.id, k.customer_id, c.tier, c.active, k.revoked_at "
-            "FROM api_keys k JOIN customers c ON c.id = k.customer_id "
-            "WHERE k.key_hash = ?", (key_hash,)
-        ).fetchone()
-
-        if not row:               return jsonify({"error": "Invalid API key"}), 401
-        if row["revoked_at"]:     return jsonify({"error": "API key revoked"}), 401
-        if not row["active"]:     return jsonify({"error": "Account suspended"}), 403
-
-        if row["tier"] != "admin":
-            quota = quota_for_tier(row["tier"])
-            cnt = db_execute(
-                "SELECT count FROM daily_counts WHERE key_id = ? AND day = ?",
-                (row["id"], today())
-            ).fetchone()
-            if (cnt["count"] if cnt else 0) >= quota:
-                return jsonify({"error": "Daily quota exceeded"}), 429
-
-        g.key_id      = row["id"]
-        g.customer_id = row["customer_id"]
-        g.tier        = row["tier"]
-        g.t0          = time.monotonic()
+    def wrapped(*args, **kwargs):
+        if "user_email" not in session:
+            return jsonify({"error": "Not authenticated"}), 401
         return f(*args, **kwargs)
-    return decorated
+    return wrapped
 
 
-def log_usage(endpoint: str, status: int):
-    if not hasattr(g, "key_id"):
-        return
+# ── ChaosKey API bridge ───────────────────────────────────────────────────────
+def ck_encrypt(plaintext: str):
+    """Encrypt plaintext via ChaosKey. Returns (ok, data)."""
+    if not CHAOSKEY_URL or not CHAOSKEY_API_KEY:
+        return False, {"error": "ChaosKey not configured. Set CHAOSKEY_URL and CHAOSKEY_API_KEY."}
     try:
-        db_execute(
-            "INSERT INTO usage_log (key_id, endpoint, ts, status, latency_ms) VALUES (?, ?, ?, ?, ?)",
-            (g.key_id, endpoint, now_iso(), status, int((time.monotonic() - g.t0) * 1000))
+        r = requests.post(
+            f"{CHAOSKEY_URL}/v1/encrypt",
+            headers={"Authorization": f"Bearer {CHAOSKEY_API_KEY}", "Content-Type": "application/json"},
+            json={"plaintext": plaintext},
+            timeout=15,
         )
-        upsert_sql = (
-            "INSERT INTO daily_counts (key_id, day, count) VALUES (%s, %s, 1) "
-            "ON CONFLICT (key_id, day) DO UPDATE SET count = daily_counts.count + 1"
-            if USE_POSTGRES else
-            "INSERT INTO daily_counts (key_id, day, count) VALUES (?, ?, 1) "
-            "ON CONFLICT(key_id, day) DO UPDATE SET count = count + 1"
-        )
-        db_execute(upsert_sql, (g.key_id, today()))
-        db_commit()
-    except Exception as e:
-        log.warning(f"log_usage failed: {e}")
-
-
-# ── Relay helper ──────────────────────────────────────────────────────────────
-def relay_request(path, method="GET", body=None):
-    if not DYNAMIC_RELAY_URL:
-        return None, {"error": "Local engine offline — start the launcher on your machine"}, 503
-    try:
-        resp = requests.request(
-            method, DYNAMIC_RELAY_URL.rstrip("/") + path,
-            headers={
-                "X-Relay-Token": RELAY_TOKEN,
-                "Content-Type": "application/json",
-            },
-            json=body, timeout=20
-        )
-        try:
-            data = resp.json()
-        except Exception:
-            data = {
-                "error": (
-                    f"Bridge returned a non-JSON response (HTTP {resp.status_code}). "
-                    "The local encryption bridge may be down — check the launcher."
-                )
-            }
-
-        if resp.status_code == 403:
-            data = {
-                "error": (
-                    "Bridge rejected the request (token mismatch). "
-                    "RELAY_TOKEN on Render must exactly match BRIDGE_SECRET in your local .env."
-                )
-            }
-
-        return resp, data, resp.status_code
+        data = r.json()
+        return r.ok, data
     except requests.exceptions.ConnectionError:
-        return None, {"error": "Cannot reach the local bridge — is the launcher running and tunnel active?"}, 503
+        return False, {"error": "Cannot reach ChaosKey — check CHAOSKEY_URL."}
     except requests.exceptions.Timeout:
-        return None, {"error": "Bridge timed out — the local machine may be overloaded"}, 504
+        return False, {"error": "ChaosKey timed out."}
     except Exception as e:
-        return None, {"error": str(e)}, 500
+        return False, {"error": str(e)}
+
+def ck_decrypt(ciphertext: str, nonce: str, enc_key: str):
+    """Decrypt ciphertext via ChaosKey. Returns (ok, data)."""
+    if not CHAOSKEY_URL or not CHAOSKEY_API_KEY:
+        return False, {"error": "ChaosKey not configured."}
+    try:
+        r = requests.post(
+            f"{CHAOSKEY_URL}/v1/decrypt",
+            headers={"Authorization": f"Bearer {CHAOSKEY_API_KEY}", "Content-Type": "application/json"},
+            json={"ciphertext": ciphertext, "nonce": nonce, "encryption_key": enc_key},
+            timeout=15,
+        )
+        data = r.json()
+        return r.ok, data
+    except requests.exceptions.ConnectionError:
+        return False, {"error": "Cannot reach ChaosKey."}
+    except requests.exceptions.Timeout:
+        return False, {"error": "ChaosKey timed out."}
+    except Exception as e:
+        return False, {"error": str(e)}
 
 
-# ── Error handlers ────────────────────────────────────────────────────────────
-@app.errorhandler(400)
-def err400(e): return jsonify({"error": "Bad request", "detail": str(e)}), 400
-@app.errorhandler(401)
-def err401(e): return jsonify({"error": "Unauthorized"}), 401
-@app.errorhandler(403)
-def err403(e): return jsonify({"error": "Forbidden"}), 403
-@app.errorhandler(404)
-def err404(e): return jsonify({"error": "Not found"}), 404
-@app.errorhandler(429)
-def err429(e): return jsonify({"error": "Too many requests"}), 429
-@app.errorhandler(500)
-def err500(e): return jsonify({"error": "Internal server error", "detail": str(e)}), 500
-
-
-# ════════════════════════════════════════════════════════════════
-#  ADMIN ENDPOINTS
-# ════════════════════════════════════════════════════════════════
-
-def admin_auth():
-    return hmac.compare_digest(
-        request.headers.get("X-Admin-Secret", ""), ADMIN_SECRET
-    )
-
-
-@app.route("/admin/set_relay", methods=["POST"])
-def set_relay():
-    if not admin_auth(): abort(403)
-    global DYNAMIC_RELAY_URL
-    new_url = (request.get_json(force=True) or {}).get("url")
-    if not new_url: return jsonify({"error": "Missing URL"}), 400
-    DYNAMIC_RELAY_URL = new_url
-    log.info(f"Relay updated to: {DYNAMIC_RELAY_URL}")
-    return jsonify({"message": "Relay updated", "url": DYNAMIC_RELAY_URL})
-
-
-@app.route("/admin/register", methods=["POST"])
-def admin_register():
-    if not admin_auth(): abort(403)
+# ── Auth routes ───────────────────────────────────────────────────────────────
+@app.route("/auth/signup", methods=["POST"])
+def signup():
     body  = request.get_json(force=True) or {}
     email = body.get("email", "").strip().lower()
-    name  = body.get("name", "").strip()
-    tier  = body.get("tier", "free")
-    pw    = body.get("password", "")
-    if not email or not name: return jsonify({"error": "email and name required"}), 400
-    if tier not in ("free", "pro", "admin"): return jsonify({"error": "tier must be free, pro, or admin"}), 400
-    try:
-        pw_hash = hash_password(pw) if pw else None
-        db_execute(
-            "INSERT INTO customers (email, name, tier, created_at, password_hash) VALUES (?, ?, ?, ?, ?)",
-            (email, name, tier, now_iso(), pw_hash)
-        )
-        db_commit()
-        cust = db_execute("SELECT id FROM customers WHERE email = ?", (email,)).fetchone()
-        raw_key, key_hash, prefix = mint_key()
-        db_execute(
-            "INSERT INTO api_keys (customer_id, key_hash, key_prefix, created_at) VALUES (?, ?, ?, ?)",
-            (cust["id"], key_hash, prefix, now_iso())
-        )
-        db_commit()
-        return jsonify({"message": "Customer registered", "api_key": raw_key,
-                        "email": email, "name": name, "tier": tier}), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 409
-
-
-@app.route("/admin/customers", methods=["GET"])
-def admin_customers():
-    if not admin_auth(): abort(403)
-    rows = db_execute(
-        "SELECT c.id, c.email, c.name, c.tier, c.active, c.created_at, "
-        "COUNT(k.id) as key_count FROM customers c "
-        "LEFT JOIN api_keys k ON k.customer_id = c.id "
-        "GROUP BY c.id ORDER BY c.created_at DESC"
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/admin/customers/<int:cid>/tier", methods=["PATCH"])
-def admin_set_tier(cid):
-    if not admin_auth(): abort(403)
-    tier = (request.get_json(force=True) or {}).get("tier")
-    if tier not in ("free", "pro", "admin"):
-        return jsonify({"error": "tier must be free, pro, or admin"}), 400
-    db_execute("UPDATE customers SET tier = ? WHERE id = ?", (tier, cid))
-    db_commit()
-    return jsonify({"message": f"Customer {cid} set to tier={tier}"})
-
-
-@app.route("/admin/customers/<int:cid>/suspend", methods=["POST"])
-def admin_suspend(cid):
-    if not admin_auth(): abort(403)
-    db_execute("UPDATE customers SET active = 0 WHERE id = ?", (cid,))
-    db_commit()
-    return jsonify({"message": f"Customer {cid} suspended"})
-
-
-@app.route("/admin/customers/<int:cid>/unsuspend", methods=["POST"])
-def admin_unsuspend(cid):
-    if not admin_auth(): abort(403)
-    db_execute("UPDATE customers SET active = 1 WHERE id = ?", (cid,))
-    db_commit()
-    return jsonify({"message": f"Customer {cid} reinstated"})
-
-
-@app.route("/admin/customers/<int:cid>/keys", methods=["GET"])
-def admin_list_keys(cid):
-    if not admin_auth(): abort(403)
-    rows = db_execute(
-        "SELECT id, key_prefix, created_at, revoked_at, label FROM api_keys WHERE customer_id = ? ORDER BY id DESC",
-        (cid,)
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/admin/stats", methods=["GET"])
-def admin_stats():
-    if not admin_auth(): abort(403)
-    total_req  = db_execute("SELECT COUNT(*) as c FROM usage_log").fetchone()["c"]
-    today_req  = db_execute("SELECT SUM(count) as c FROM daily_counts WHERE day = ?", (today(),)).fetchone()["c"]
-    total_cust = db_execute("SELECT COUNT(*) as c FROM customers WHERE active = 1").fetchone()["c"]
-    tier_breakdown = db_execute(
-        "SELECT tier, COUNT(*) as c FROM customers WHERE active = 1 GROUP BY tier"
-    ).fetchall()
-    top_users = db_execute(
-        "SELECT c.email, c.tier, SUM(d.count) as total "
-        "FROM daily_counts d JOIN api_keys k ON k.id = d.key_id "
-        "JOIN customers c ON c.id = k.customer_id "
-        "GROUP BY c.email, c.tier ORDER BY total DESC LIMIT 10"
-    ).fetchall()
-    total_msgs = db_execute("SELECT COUNT(*) as c FROM chat_messages").fetchone()["c"]
-    return jsonify({
-        "total_customers":     total_cust,
-        "total_requests":      total_req,
-        "today_requests":      today_req or 0,
-        "total_chat_messages": total_msgs,
-        "relay_active":        bool(DYNAMIC_RELAY_URL),
-        "relay_url":           DYNAMIC_RELAY_URL or None,
-        "tier_breakdown":      [dict(r) for r in tier_breakdown],
-        "top_users":           [dict(r) for r in top_users],
-    })
-
-
-@app.route("/admin/usage_log", methods=["GET"])
-def admin_usage_log():
-    if not admin_auth(): abort(403)
-    rows = db_execute(
-        "SELECT u.id, c.email, u.endpoint, u.ts, u.status, u.latency_ms "
-        "FROM usage_log u JOIN api_keys k ON k.id = u.key_id "
-        "JOIN customers c ON c.id = k.customer_id "
-        "ORDER BY u.id DESC LIMIT 200"
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/admin/chat_messages", methods=["GET"])
-def admin_chat_messages():
-    """Admin: view recent chat metadata (payloads are encrypted — no plaintext visible)."""
-    if not admin_auth(): abort(403)
-    rows = db_execute(
-        "SELECT id, sender, recipient, timestamp FROM chat_messages ORDER BY id DESC LIMIT 200"
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-# ════════════════════════════════════════════════════════════════
-#  PUBLIC AUTH ENDPOINTS
-# ════════════════════════════════════════════════════════════════
-
-@app.route("/v1/register", methods=["POST"])
-def public_register():
-    body     = request.get_json(force=True) or {}
-    email    = body.get("email", "").strip().lower()
-    password = body.get("password", "").strip()
-    name     = body.get("name", "").strip() or email.split("@")[0]
+    pw    = body.get("password", "").strip()
+    name  = body.get("name", "").strip() or email.split("@")[0]
 
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
-    if not password or len(password) < 6:
+    if not pw or len(pw) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
 
+    color = pick_color(email)
     try:
-        pw_hash = hash_password(password)
-        db_execute(
-            "INSERT INTO customers (email, name, tier, created_at, password_hash) VALUES (?, ?, 'free', ?, ?)",
-            (email, name, now_iso(), pw_hash)
+        db_exec(
+            "INSERT INTO users (email, display_name, password_hash, created_at, avatar_color) VALUES (?,?,?,?,?)",
+            (email, name, hash_password(pw), now_iso(), color)
         )
         db_commit()
-        cust = db_execute("SELECT id FROM customers WHERE email = ?", (email,)).fetchone()
-        raw_key, key_hash, prefix = mint_key()
-        db_execute(
-            "INSERT INTO api_keys (customer_id, key_hash, key_prefix, created_at, label) VALUES (?, ?, ?, ?, 'primary')",
-            (cust["id"], key_hash, prefix, now_iso())
-        )
-        db_commit()
-        return jsonify({
-            "api_key": raw_key,
-            "tier":    "free",
-            "quota":   FREE_QUOTA_DAY,
-            "note":    "Save this key — it is shown only once.",
-        }), 201
     except Exception as e:
-        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-            return jsonify({"error": "Email already registered. Please log in instead."}), 409
+        if "unique" in str(e).lower():
+            return jsonify({"error": "Email already registered"}), 409
         return jsonify({"error": str(e)}), 500
 
+    session["user_email"] = email
+    session["user_name"]  = name
+    session["user_color"] = color
+    return jsonify({"ok": True, "email": email, "name": name, "color": color}), 201
 
-@app.route("/v1/login", methods=["POST"])
-def public_login():
-    body     = request.get_json(force=True) or {}
-    email    = body.get("email", "").strip().lower()
-    password = body.get("password", "").strip()
 
-    if not email or not password:
+@app.route("/auth/login", methods=["POST"])
+def login():
+    body  = request.get_json(force=True) or {}
+    email = body.get("email", "").strip().lower()
+    pw    = body.get("password", "").strip()
+
+    if not email or not pw:
         return jsonify({"error": "Email and password required"}), 400
 
-    cust = db_execute(
-        "SELECT id, name, tier, active, password_hash FROM customers WHERE email = ?", (email,)
+    user = db_exec(
+        "SELECT email, display_name, password_hash, avatar_color FROM users WHERE email = ?", (email,)
     ).fetchone()
 
-    if not cust:                     return jsonify({"error": "Invalid email or password"}), 401
-    if not cust["active"]:           return jsonify({"error": "Account suspended"}), 403
-    if not cust["password_hash"]:    return jsonify({"error": "No password set. Contact support."}), 401
-    if not check_password(password, cust["password_hash"]):
+    if not user or not check_password(pw, user["password_hash"]):
         return jsonify({"error": "Invalid email or password"}), 401
 
-    key_row = db_execute(
-        "SELECT key_hash, key_prefix, created_at FROM api_keys "
-        "WHERE customer_id = ? AND revoked_at IS NULL ORDER BY id DESC LIMIT 1",
-        (cust["id"],)
-    ).fetchone()
+    session["user_email"] = user["email"]
+    session["user_name"]  = user["display_name"]
+    session["user_color"] = user["avatar_color"]
+    return jsonify({"ok": True, "email": user["email"], "name": user["display_name"], "color": user["avatar_color"]})
 
-    if not key_row:
-        return jsonify({"error": "No active key found. Use /v1/rotate_key."}), 404
 
-    quota = quota_for_tier(cust["tier"])
+@app.route("/auth/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/auth/me", methods=["GET"])
+def me():
+    if "user_email" not in session:
+        return jsonify({"authenticated": False}), 200
     return jsonify({
-        "message":    "Login successful",
-        "name":       cust["name"],
-        "tier":       cust["tier"],
-        "quota":      quota,
-        "key_prefix": key_row["key_prefix"],
-        "key_created": key_row["created_at"],
-        "note": "Raw key shown only once at registration. Use /v1/rotate_key if lost.",
-    }), 200
+        "authenticated": True,
+        "email": session["user_email"],
+        "name": session["user_name"],
+        "color": session.get("user_color", "#ff6b35"),
+    })
 
 
-@app.route("/v1/rotate_key", methods=["POST"])
-def rotate_key():
-    body     = request.get_json(force=True) or {}
-    email    = body.get("email", "").strip().lower()
-    password = body.get("password", "").strip()
+# ── Message routes ────────────────────────────────────────────────────────────
+@app.route("/msg/send", methods=["POST"])
+@require_login
+def send_message():
+    body      = request.get_json(force=True) or {}
+    recipient = body.get("recipient", "").strip().lower()
+    plaintext = body.get("plaintext", "").strip()
+    sender    = session["user_email"]
 
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
+    if not recipient or not plaintext:
+        return jsonify({"error": "recipient and plaintext required"}), 400
+    if recipient == sender:
+        return jsonify({"error": "Cannot message yourself"}), 400
 
-    cust = db_execute(
-        "SELECT id, active, password_hash, tier FROM customers WHERE email = ?", (email,)
-    ).fetchone()
+    # Check recipient exists
+    exists = db_exec("SELECT id FROM users WHERE email = ?", (recipient,)).fetchone()
+    if not exists:
+        return jsonify({"error": f"User '{recipient}' not found on BurnChat"}), 404
 
-    if not cust or not cust["password_hash"] or not check_password(password, cust["password_hash"]):
-        return jsonify({"error": "Invalid email or password"}), 401
-    if not cust["active"]:
-        return jsonify({"error": "Account suspended"}), 403
+    # Encrypt via ChaosKey
+    ok, enc = ck_encrypt(plaintext)
+    if not ok:
+        return jsonify({"error": enc.get("error", "Encryption failed")}), 502
 
-    db_execute(
-        "UPDATE api_keys SET revoked_at = ? WHERE customer_id = ? AND revoked_at IS NULL",
-        (now_iso(), cust["id"])
-    )
-    raw_key, key_hash, prefix = mint_key()
-    db_execute(
-        "INSERT INTO api_keys (customer_id, key_hash, key_prefix, created_at, label) VALUES (?, ?, ?, ?, 'primary')",
-        (cust["id"], key_hash, prefix, now_iso())
+    db_exec(
+        "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (sender, recipient,
+         enc.get("ciphertext", ""),
+         enc.get("nonce", ""),
+         enc.get("encryption_key", ""),
+         plaintext,   # also stored in plaintext for fast retrieval (server trusted)
+         now_iso())
     )
     db_commit()
-    return jsonify({
-        "api_key": raw_key,
-        "tier":    cust["tier"],
-        "note":    "Old key revoked. Save this new key — not shown again.",
-    }), 201
+    return jsonify({"ok": True, "sent_at": now_iso()}), 201
 
 
-# ════════════════════════════════════════════════════════════════
-#  AUTHENTICATED API ENDPOINTS
-# ════════════════════════════════════════════════════════════════
+@app.route("/msg/thread", methods=["GET"])
+@require_login
+def get_thread():
+    contact = request.args.get("with", "").strip().lower()
+    me      = session["user_email"]
 
-@app.route("/v1/keys", methods=["POST"])
-def issue_key():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "Missing Authorization header"}), 401
-    key_hash = hashlib.sha256(auth[7:].encode()).hexdigest()
-    row = db_execute(
-        "SELECT k.customer_id, k.revoked_at, c.active FROM api_keys k "
-        "JOIN customers c ON c.id = k.customer_id WHERE k.key_hash = ?", (key_hash,)
-    ).fetchone()
-    if not row or row["revoked_at"] or not row["active"]:
-        return jsonify({"error": "Invalid or revoked API key"}), 401
-    label = (request.get_json(force=True) or {}).get("label", "secondary")
-    raw_key, new_hash, prefix = mint_key()
-    db_execute(
-        "INSERT INTO api_keys (customer_id, key_hash, key_prefix, created_at, label) VALUES (?, ?, ?, ?, ?)",
-        (row["customer_id"], new_hash, prefix, now_iso(), label)
-    )
-    db_commit()
-    return jsonify({"api_key": raw_key, "label": label,
-                    "note": "Store this key safely — not shown again."}), 201
+    if not contact:
+        return jsonify({"error": "?with= required"}), 400
 
-
-@app.route("/v1/usage", methods=["GET"])
-@require_api_key
-def usage():
-    today_count = db_execute(
-        "SELECT count FROM daily_counts WHERE key_id = ? AND day = ?", (g.key_id, today())
-    ).fetchone()
-    quota = quota_for_tier(g.tier)
-    recent = db_execute(
-        "SELECT endpoint, ts, status, latency_ms FROM usage_log "
-        "WHERE key_id = ? ORDER BY id DESC LIMIT 20", (g.key_id,)
+    rows = db_exec(
+        "SELECT id, sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at "
+        "FROM messages "
+        "WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?) "
+        "ORDER BY id ASC",
+        (me, contact, contact, me)
     ).fetchall()
-    used = today_count["count"] if today_count else 0
-    return jsonify({
-        "tier":            g.tier,
-        "quota_today":     quota if g.tier != "admin" else "unlimited",
-        "used_today":      used,
-        "remaining_today": max(0, quota - used) if g.tier != "admin" else "unlimited",
-        "recent_calls":    [dict(r) for r in recent],
-    })
+
+    result = []
+    for r in rows:
+        text = r["plaintext"]  # fast path — already stored
+        if not text:           # fallback: decrypt via ChaosKey
+            ok, dec = ck_decrypt(r["ciphertext"], r["nonce"], r["enc_key"])
+            text = dec.get("plaintext", "[Decryption failed]") if ok else "[Decryption failed]"
+        result.append({
+            "id":        r["id"],
+            "from":      r["sender"],
+            "text":      text,
+            "cipher":    r["ciphertext"][:32] + "…" if r["ciphertext"] else "",
+            "sent_at":   r["sent_at"],
+        })
+
+    return jsonify(result)
 
 
-@app.route("/v1/encrypt", methods=["POST"])
-@require_api_key
-def encrypt():
-    body = request.get_json(force=True) or {}
-    if "plaintext" not in body:
-        return jsonify({"error": "Missing 'plaintext' field"}), 400
-    _, data, status = relay_request("/relay/encrypt", "POST", {"plaintext": body.get("plaintext")})
-    log_usage("/v1/encrypt", status)
-    return jsonify(data), status
+@app.route("/msg/burn", methods=["POST"])
+@require_login
+def burn_thread():
+    body    = request.get_json(force=True) or {}
+    contact = body.get("contact", "").strip().lower()
+    me      = session["user_email"]
+
+    if not contact:
+        return jsonify({"error": "contact required"}), 400
+
+    db_exec(
+        "DELETE FROM messages WHERE "
+        "(sender=? AND recipient=?) OR (sender=? AND recipient=?)",
+        (me, contact, contact, me)
+    )
+    db_commit()
+    return jsonify({"ok": True, "burned": True})
 
 
-@app.route("/v1/decrypt", methods=["POST"])
-@require_api_key
-def decrypt():
-    body = request.get_json(force=True) or {}
-    if not {"ciphertext", "nonce", "encryption_key"}.issubset(body):
-        return jsonify({"error": "Missing ciphertext, nonce, or encryption_key"}), 400
-    _, data, status = relay_request("/relay/decrypt", "POST", {
-        "ciphertext":     body.get("ciphertext"),
-        "nonce":          body.get("nonce"),
-        "encryption_key": body.get("encryption_key"),
-    })
-    log_usage("/v1/decrypt", status)
-    return jsonify(data), status
+@app.route("/msg/inbox", methods=["GET"])
+@require_login
+def inbox():
+    me = session["user_email"]
+    rows = db_exec(
+        "SELECT "
+        "  CASE WHEN sender=? THEN recipient ELSE sender END as contact, "
+        "  MAX(sent_at) as last_at, "
+        "  COUNT(*) as total, "
+        "  SUM(CASE WHEN sender!=? THEN 1 ELSE 0 END) as received "
+        "FROM messages WHERE sender=? OR recipient=? "
+        "GROUP BY contact ORDER BY last_at DESC",
+        (me, me, me, me)
+    ).fetchall()
+
+    contacts_with_info = []
+    for r in rows:
+        user = db_exec(
+            "SELECT display_name, avatar_color FROM users WHERE email=?", (r["contact"],)
+        ).fetchone()
+        contacts_with_info.append({
+            "contact":  r["contact"],
+            "name":     user["display_name"] if user else r["contact"].split("@")[0],
+            "color":    user["avatar_color"] if user else "#888",
+            "last_at":  r["last_at"],
+            "total":    r["total"],
+        })
+    return jsonify(contacts_with_info)
 
 
-@app.route("/v1/export_key", methods=["GET"])
-@require_api_key
-def export_key():
-    _, data, status = relay_request("/relay/export_key", "GET")
-    log_usage("/v1/export_key", status)
-    return jsonify(data), status
-
-
-@app.route("/v1/status", methods=["GET"])
-@require_api_key
-def api_status():
-    _, data, status = relay_request("/relay/status")
-    return jsonify(data), status
-
-
-# ── Public stats ──────────────────────────────────────────────────────────────
-@app.route("/public/stats", methods=["GET"])
-def public_stats():
-    total = db_execute("SELECT COUNT(*) as c FROM customers WHERE active = 1").fetchone()["c"]
-    today_req = db_execute(
-        "SELECT SUM(count) as c FROM daily_counts WHERE day = ?", (today(),)
-    ).fetchone()["c"]
-    return jsonify({"total_customers": total, "today_requests": today_req or 0})
+@app.route("/msg/search_user", methods=["GET"])
+@require_login
+def search_user():
+    q = request.args.get("q", "").strip().lower()
+    if not q or len(q) < 3:
+        return jsonify([])
+    rows = db_exec(
+        "SELECT email, display_name, avatar_color FROM users "
+        "WHERE (email LIKE ? OR display_name LIKE ?) AND email != ? LIMIT 10",
+        (f"%{q}%", f"%{q}%", session["user_email"])
+    ).fetchall()
+    return jsonify([{"email": r["email"], "name": r["display_name"], "color": r["avatar_color"]} for r in rows])
 
 
 @app.route("/health")
 def health():
+    ck_ok = bool(CHAOSKEY_URL and CHAOSKEY_API_KEY)
     return jsonify({
-        "status":        "ok",
-        "tunnel_active": bool(DYNAMIC_RELAY_URL),
-        "relay_url":     DYNAMIC_RELAY_URL or None,
-        "db_backend":    "postgresql" if USE_POSTGRES else "sqlite",
+        "status":           "ok",
+        "chaoskey_url":     CHAOSKEY_URL or None,
+        "chaoskey_ready":   ck_ok,
     })
 
 
 # ════════════════════════════════════════════════════════════════
-#  BURNCHAT MESSAGE RELAY
+#  FRONTEND  (single-page app served at /)
 # ════════════════════════════════════════════════════════════════
 
-@app.route("/api/send", methods=["POST"])
-def chat_send():
-    """
-    Store an encrypted message bundle.
-    Body: { sender, recipient, payload: { from, plaintext, ciphertext, nonce, encryption_key } }
-    The server stores the full payload (including plaintext) — use this route only over HTTPS.
-    The ciphertext + nonce + encryption_key fields allow the recipient to independently decrypt.
-    """
-    body      = request.get_json(force=True) or {}
-    sender    = body.get("sender", "").strip().lower()
-    recipient = body.get("recipient", "").strip().lower()
-    payload   = body.get("payload")
-
-    if not sender or not recipient or payload is None:
-        return jsonify({"error": "sender, recipient, and payload are required"}), 400
-    if "@" not in sender:
-        return jsonify({"error": "Invalid sender email"}), 400
-    if "@" not in recipient:
-        return jsonify({"error": "Invalid recipient email"}), 400
-
-    db_execute(
-        "INSERT INTO chat_messages (sender, recipient, payload, timestamp) VALUES (?, ?, ?, ?)",
-        (sender, recipient, json.dumps(payload), now_iso())
-    )
-    db_commit()
-    return jsonify({"ok": True}), 201
-
-
-@app.route("/api/get_messages", methods=["GET"])
-def chat_get_messages():
-    """
-    Fetch all messages between two users (both directions), ordered oldest first.
-    Query params: user, contact
-    Returns: [ { sender, recipient, payload, timestamp }, ... ]
-    """
-    user    = request.args.get("user", "").strip().lower()
-    contact = request.args.get("contact", "").strip().lower()
-
-    if not user or not contact:
-        return jsonify({"error": "user and contact query params are required"}), 400
-
-    rows = db_execute(
-        "SELECT sender, recipient, payload, timestamp FROM chat_messages "
-        "WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?) "
-        "ORDER BY id ASC",
-        (user, contact, contact, user)
-    ).fetchall()
-
-    return jsonify([
-        {
-            "sender":    r["sender"],
-            "recipient": r["recipient"],
-            "payload":   r["payload"],   # JSON string — client must parse
-            "timestamp": r["timestamp"],
-        }
-        for r in rows
-    ])
-
-
-@app.route("/api/delete_messages", methods=["POST"])
-def chat_delete_messages():
-    """
-    Delete all messages between two users (burn the thread).
-    Body: { user, contact }
-    """
-    body    = request.get_json(force=True) or {}
-    user    = body.get("user", "").strip().lower()
-    contact = body.get("contact", "").strip().lower()
-
-    if not user or not contact:
-        return jsonify({"error": "user and contact are required"}), 400
-
-    db_execute(
-        "DELETE FROM chat_messages WHERE "
-        "(sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)",
-        (user, contact, contact, user)
-    )
-    db_commit()
-    return jsonify({"ok": True, "message": "Conversation deleted"})
-
-
-@app.route("/api/inbox", methods=["GET"])
-def chat_inbox():
-    """
-    Get a summary of all conversations for a user.
-    Query param: user
-    Returns: [ { contact, last_timestamp, message_count }, ... ]
-    """
-    user = request.args.get("user", "").strip().lower()
-    if not user:
-        return jsonify({"error": "user query param required"}), 400
-
-    rows = db_execute(
-        "SELECT "
-        "  CASE WHEN sender = ? THEN recipient ELSE sender END as contact, "
-        "  MAX(timestamp) as last_timestamp, "
-        "  COUNT(*) as message_count "
-        "FROM chat_messages "
-        "WHERE sender = ? OR recipient = ? "
-        "GROUP BY contact "
-        "ORDER BY last_timestamp DESC",
-        (user, user, user)
-    ).fetchall()
-
-    return jsonify([dict(r) for r in rows])
-
-
-# ════════════════════════════════════════════════════════════════
-#  BURNCHAT FRONTEND  (served at /chat)
-# ════════════════════════════════════════════════════════════════
-
-BURNCHAT_HTML = r"""<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BurnChat — Encrypted Messaging</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg: #0f172a; --bg2: #1e293b; --bg3: #0d1829;
-            --accent: #38bdf8; --accent2: #0ea5e9;
-            --text: #f1f5f9; --text2: #94a3b8;
-            --border: #2d3f55; --mine: #0284c7; --theirs: #1e3a5f;
-            --radius: 12px; --danger: #ef4444;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
-
-        /* Auth */
-        #auth-screen { flex: 1; display: flex; align-items: center; justify-content: center; }
-        .auth-card { width: 100%; max-width: 400px; background: var(--bg2); padding: 2.5rem; border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 25px 50px rgba(0,0,0,0.5); }
-        .auth-logo { text-align: center; margin-bottom: 2rem; }
-        .auth-logo h1 { font-size: 1.6rem; font-weight: 600; }
-        .auth-logo p { color: var(--text2); font-size: 0.85rem; margin-top: 0.3rem; }
-        .auth-tabs { display: flex; margin-bottom: 1.5rem; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-        .auth-tab { flex: 1; padding: 0.6rem; background: none; border: none; color: var(--text2); font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: 'Inter', sans-serif; }
-        .auth-tab.active { background: var(--accent); color: #fff; }
-        .form-group { margin-bottom: 1rem; }
-        .form-group label { display: block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text2); margin-bottom: 0.4rem; }
-        .form-group input { width: 100%; padding: 0.7rem 0.9rem; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 0.9rem; outline: none; font-family: 'Inter', sans-serif; transition: border-color 0.2s; }
-        .form-group input:focus { border-color: var(--accent); }
-        .btn { width: 100%; padding: 0.75rem; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: 600; font-size: 0.9rem; cursor: pointer; font-family: 'Inter', sans-serif; transition: background 0.2s; }
-        .btn:hover { background: var(--accent2); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .auth-err { color: var(--danger); font-size: 0.8rem; margin-top: 0.75rem; min-height: 1.2rem; text-align: center; }
-
-        /* Chat Layout */
-        #chat-screen { flex: 1; display: none; overflow: hidden; }
-        .chat-layout { display: flex; height: 100vh; }
-
-        /* Sidebar */
-        .sidebar { width: 280px; background: var(--bg2); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
-        .sidebar-header { padding: 1rem 1.2rem; border-bottom: 1px solid var(--border); }
-        .user-info { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
-        .user-info .uname { font-weight: 600; font-size: 0.9rem; }
-        .user-info .utier { font-size: 0.65rem; color: var(--accent); background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.2); padding: 0.15rem 0.5rem; border-radius: 20px; }
-        .logout-link { font-size: 0.72rem; color: var(--danger); cursor: pointer; background: none; border: none; font-family: 'Inter', sans-serif; }
-        .add-contact { display: flex; gap: 0.5rem; }
-        .add-contact input { flex: 1; padding: 0.5rem 0.7rem; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 0.8rem; outline: none; font-family: 'Inter', sans-serif; }
-        .add-contact input:focus { border-color: var(--accent); }
-        .add-contact button { padding: 0.5rem 0.8rem; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
-        .contact-list { flex: 1; overflow-y: auto; }
-        .contact-item { padding: 0.9rem 1.2rem; cursor: pointer; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,0.04); transition: background 0.15s; }
-        .contact-item:hover { background: rgba(255,255,255,0.04); }
-        .contact-item.active { background: rgba(56,189,248,0.08); border-left: 3px solid var(--accent); }
-        .c-avatar { width: 36px; height: 36px; border-radius: 50%; background: rgba(56,189,248,0.15); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.85rem; color: var(--accent); flex-shrink: 0; }
-        .c-name { font-size: 0.88rem; font-weight: 500; }
-        .c-email { font-size: 0.7rem; color: var(--text2); }
-        .c-badge { margin-left: auto; background: var(--accent); color: #fff; border-radius: 20px; font-size: 0.65rem; padding: 0.1rem 0.45rem; font-weight: 600; }
-
-        /* Chat panel */
-        .chat-panel { flex: 1; display: flex; flex-direction: column; background: var(--bg); min-width: 0; }
-        .chat-top { padding: 0.9rem 1.5rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: var(--bg2); }
-        .ct-name { font-weight: 600; font-size: 0.95rem; }
-        .ct-sub { font-size: 0.7rem; color: var(--accent); margin-top: 2px; }
-        .burn-btn { padding: 0.4rem 0.9rem; background: rgba(239,68,68,0.1); color: var(--danger); border: 1px solid rgba(239,68,68,0.2); border-radius: 6px; font-size: 0.75rem; cursor: pointer; font-family: 'Inter', sans-serif; transition: all 0.2s; }
-        .burn-btn:hover { background: rgba(239,68,68,0.2); }
-        .messages { flex: 1; overflow-y: auto; padding: 1.25rem; display: flex; flex-direction: column; gap: 0.75rem; }
-        .empty-chat { flex: 1; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 0.5rem; color: var(--text2); font-size: 0.9rem; }
-        .msg-wrap { display: flex; flex-direction: column; max-width: 68%; }
-        .msg-wrap.mine { align-self: flex-end; align-items: flex-end; }
-        .msg-wrap.theirs { align-self: flex-start; align-items: flex-start; }
-        .bubble { padding: 0.7rem 1rem; border-radius: 14px; font-size: 0.9rem; line-height: 1.55; word-break: break-word; }
-        .mine .bubble { background: var(--mine); border-bottom-right-radius: 3px; }
-        .theirs .bubble { background: var(--theirs); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
-        .msg-meta { font-size: 0.68rem; color: var(--text2); margin-top: 3px; }
-        .cipher-peek { font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--accent); opacity: 0.5; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
-        .compose { padding: 1rem 1.5rem; background: var(--bg2); border-top: 1px solid var(--border); display: flex; gap: 0.75rem; align-items: flex-end; }
-        .compose textarea { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 0.7rem 1rem; color: var(--text); font-size: 0.9rem; font-family: 'Inter', sans-serif; resize: none; outline: none; line-height: 1.5; max-height: 120px; transition: border-color 0.2s; }
-        .compose textarea:focus { border-color: var(--accent); }
-        .send-btn { padding: 0.7rem 1.4rem; background: var(--accent); color: #fff; border: none; border-radius: 10px; font-size: 0.9rem; font-weight: 600; cursor: pointer; font-family: 'Inter', sans-serif; transition: background 0.2s; height: 42px; white-space: nowrap; }
-        .send-btn:hover { background: var(--accent2); }
-        .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-        .no-chat { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text2); font-size: 0.9rem; text-align: center; padding: 2rem; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-    </style>
-</head>
-<body>
-
-<!-- Auth Screen -->
-<div id="auth-screen">
-    <div class="auth-card">
-        <div class="auth-logo">
-            <h1>🔥 BurnChat</h1>
-            <p>End-to-end encrypted messaging via ChaosKey</p>
-        </div>
-        <div class="auth-tabs">
-            <button class="auth-tab active" id="tab-login" onclick="switchTab('login')">Sign In</button>
-            <button class="auth-tab" id="tab-register" onclick="switchTab('register')">Register</button>
-        </div>
-        <div class="form-group">
-            <label>Email</label>
-            <input id="auth-email" type="email" placeholder="you@example.com" autocomplete="email"
-                onkeydown="if(event.key==='Enter')document.getElementById('auth-pw').focus()">
-        </div>
-        <div class="form-group">
-            <label>Password</label>
-            <input id="auth-pw" type="password" placeholder="••••••••" autocomplete="current-password"
-                onkeydown="if(event.key==='Enter')doAuth()">
-        </div>
-        <div class="form-group" id="name-group" style="display:none">
-            <label>Your name (optional)</label>
-            <input id="auth-name" type="text" placeholder="Display name">
-        </div>
-        <button class="btn" id="auth-btn" onclick="doAuth()">Sign In →</button>
-        <div class="auth-err" id="auth-err"></div>
-    </div>
-</div>
-
-<!-- Chat Screen -->
-<div id="chat-screen">
-    <div class="chat-layout">
-        <!-- Sidebar -->
-        <div class="sidebar">
-            <div class="sidebar-header">
-                <div class="user-info">
-                    <div>
-                        <div class="uname" id="sb-name">User</div>
-                        <div class="utier" id="sb-tier">FREE</div>
-                    </div>
-                    <button class="logout-link" onclick="doLogout()">Sign out</button>
-                </div>
-                <div class="add-contact">
-                    <input id="add-input" type="email" placeholder="Add contact by email…"
-                        onkeydown="if(event.key==='Enter')addContact()">
-                    <button onclick="addContact()">+</button>
-                </div>
-            </div>
-            <div class="contact-list" id="contact-list">
-                <div style="padding:1rem;font-size:0.8rem;color:var(--text2)">
-                    Add a contact above to begin.
-                </div>
-            </div>
-        </div>
-
-        <!-- Main chat -->
-        <div class="chat-panel">
-            <div class="no-chat" id="no-chat">
-                Select or add a contact to start an encrypted conversation.
-            </div>
-            <div id="active-chat" style="display:none;flex-direction:column;height:100%">
-                <div class="chat-top">
-                    <div>
-                        <div class="ct-name" id="ct-name"></div>
-                        <div class="ct-sub">🔐 AES-256-GCM · keys rotate every 10s</div>
-                    </div>
-                    <button class="burn-btn" onclick="burnThread()">🔥 Burn thread</button>
-                </div>
-                <div class="messages" id="messages-area"></div>
-                <div class="compose">
-                    <textarea id="compose-input" rows="1"
-                        placeholder="Type an encrypted message… (Enter to send)"
-                        oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'"
-                        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
-                    <button class="send-btn" id="send-btn" onclick="sendMessage()">Send</button>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<script>
-// ── State ──────────────────────────────────────────────────────────────────
-const S = {
-    apiKey: '', myEmail: '', myName: '',
-    contacts: [], messages: {}, unread: {},
-    active: null, pollTimer: null, authMode: 'login'
-};
-
-// ── Tiny helpers ───────────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const initials = e => (e||'?')[0].toUpperCase();
-const shortTs  = iso => iso ? iso.slice(11,16) : new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-
-async function api(path, opts = {}) {
-    try {
-        const r = await fetch(path, { ...opts, headers: {'Content-Type':'application/json', ...(opts.headers||{})} });
-        return { ok: r.ok, data: await r.json() };
-    } catch(e) { return { ok: false, data: { error: e.message } }; }
-}
-
-// ── Auth ───────────────────────────────────────────────────────────────────
-function switchTab(mode) {
-    S.authMode = mode;
-    $('tab-login').classList.toggle('active', mode==='login');
-    $('tab-register').classList.toggle('active', mode==='register');
-    $('auth-btn').textContent = mode==='login' ? 'Sign In →' : 'Create Account →';
-    $('name-group').style.display = mode==='register' ? 'block' : 'none';
-    $('auth-err').textContent = '';
-}
-
-async function doAuth() {
-    const email = $('auth-email').value.trim().toLowerCase();
-    const pw    = $('auth-pw').value;
-    const name  = $('auth-name').value.trim();
-    const err   = $('auth-err');
-    const btn   = $('auth-btn');
-    if (!email || !pw) { err.textContent = 'Email and password required.'; return; }
-    btn.disabled = true;
-    err.textContent = S.authMode==='login' ? 'Signing in…' : 'Creating account…';
-
-    if (S.authMode === 'register') {
-        const {ok, data} = await api('/v1/register', {method:'POST', body:JSON.stringify({email,password:pw,name})});
-        if (!ok) { err.textContent = '✗ '+(data.error||'Registration failed'); btn.disabled=false; return; }
-        S.apiKey   = data.api_key;
-        S.myEmail  = email;
-        S.myName   = name || email.split('@')[0];
-        enterChat('free');
-    } else {
-        const {ok, data} = await api('/v1/login', {method:'POST', body:JSON.stringify({email,password:pw})});
-        if (!ok) { err.textContent = '✗ '+(data.error||'Login failed'); btn.disabled=false; return; }
-        // Rotate to get a fresh session key
-        const rot = await api('/v1/rotate_key', {method:'POST', body:JSON.stringify({email,password:pw})});
-        if (rot.ok) S.apiKey = rot.data.api_key;
-        S.myEmail = email;
-        S.myName  = data.name || email.split('@')[0];
-        enterChat(data.tier);
-    }
-}
-
-function enterChat(tier) {
-    $('auth-screen').style.display = 'none';
-    $('chat-screen').style.display = 'flex';
-    $('sb-name').textContent = S.myName;
-    $('sb-tier').textContent = (tier||'free').toUpperCase();
-    startPolling();
-}
-
-function doLogout() {
-    stopPolling();
-    Object.assign(S, {apiKey:'',myEmail:'',myName:'',contacts:[],messages:{},unread:{},active:null});
-    $('auth-screen').style.display = 'flex';
-    $('chat-screen').style.display = 'none';
-    $('auth-pw').value = '';
-    $('auth-btn').disabled = false;
-    $('auth-err').textContent = '';
-    renderContacts();
-}
-
-// ── Contacts ───────────────────────────────────────────────────────────────
-function addContact() {
-    const inp   = $('add-input');
-    const email = inp.value.trim().toLowerCase();
-    if (!email || !email.includes('@') || email===S.myEmail) { inp.value=''; return; }
-    if (!S.contacts.includes(email)) {
-        S.contacts.push(email);
-        S.messages[email] = S.messages[email] || [];
-        S.unread[email]   = 0;
-    }
-    inp.value = '';
-    renderContacts();
-    openConversation(email);
-}
-
-function renderContacts() {
-    const el = $('contact-list');
-    if (!S.contacts.length) {
-        el.innerHTML = '<div style="padding:1rem;font-size:0.8rem;color:var(--text2)">Add a contact above to begin.</div>';
-        return;
-    }
-    el.innerHTML = S.contacts.map(email => {
-        const u = S.unread[email]||0;
-        return `<div class="contact-item${S.active===email?' active':''}" onclick="openConversation('${email}')">
-            <div class="c-avatar">${initials(email)}</div>
-            <div><div class="c-name">${email.split('@')[0]}</div><div class="c-email">${email}</div></div>
-            ${u>0?`<div class="c-badge">${u}</div>`:''}
-        </div>`;
-    }).join('');
-}
-
-// ── Conversation ───────────────────────────────────────────────────────────
-function openConversation(email) {
-    S.active = email; S.unread[email]=0;
-    $('no-chat').style.display = 'none';
-    $('active-chat').style.display = 'flex';
-    $('ct-name').textContent = email;
-    renderContacts();
-    renderMessages();
-    loadMessages();
-}
-
-function renderMessages() {
-    const msgs = S.messages[S.active]||[];
-    const area = $('messages-area');
-    if (!area) return;
-    if (!msgs.length) {
-        area.innerHTML = `<div class="empty-chat"><div style="font-size:2rem;margin-bottom:0.5rem">🔐</div><div>No messages yet — say hello!</div><div style="font-size:0.75rem;margin-top:0.25rem;color:var(--text2)">All messages are AES-256-GCM encrypted</div></div>`;
-        return;
-    }
-    area.innerHTML = msgs.map(m => `
-        <div class="msg-wrap ${m.from===S.myEmail?'mine':'theirs'}">
-            <div class="bubble">${esc(m.text)}</div>
-            ${m.cipher?`<div class="cipher-peek" title="Ciphertext: ${m.cipher}">⚿ ${m.cipher.slice(0,30)}…</div>`:''}
-            <div class="msg-meta">${m.ts}</div>
-        </div>`).join('');
-    area.scrollTop = area.scrollHeight;
-}
-
-// ── Send ───────────────────────────────────────────────────────────────────
-async function sendMessage() {
-    const inp = $('compose-input');
-    const txt = inp.value.trim();
-    if (!txt || !S.active || !S.apiKey) return;
-    const btn = $('send-btn');
-    btn.disabled = true;
-    inp.value = ''; inp.style.height = 'auto';
-
-    // 1. Encrypt via ChaosKey
-    const {ok, data} = await api('/v1/encrypt', {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + S.apiKey },
-        body: JSON.stringify({ plaintext: txt })
-    });
-
-    if (!ok) {
-        alert('Encryption failed: ' + (data.error||'unknown error'));
-        inp.value = txt; btn.disabled = false; return;
-    }
-
-    // 2. Store on server
-    await api('/api/send', {
-        method: 'POST',
-        body: JSON.stringify({
-            sender: S.myEmail, recipient: S.active,
-            payload: { from:S.myEmail, plaintext:txt, ciphertext:data.ciphertext, nonce:data.nonce, encryption_key:data.encryption_key }
-        })
-    });
-
-    // 3. Show immediately (optimistic)
-    (S.messages[S.active]=S.messages[S.active]||[]).push({
-        from: S.myEmail, text: txt, cipher: data.ciphertext,
-        ts: new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
-    });
-    renderMessages();
-    btn.disabled = false;
-}
-
-// ── Burn ───────────────────────────────────────────────────────────────────
-async function burnThread() {
-    if (!S.active) return;
-    if (!confirm(`Permanently delete your thread with ${S.active}?`)) return;
-    await api('/api/delete_messages', {method:'POST', body:JSON.stringify({user:S.myEmail,contact:S.active})});
-    S.messages[S.active] = [];
-    renderMessages();
-}
-
-// ── Polling ────────────────────────────────────────────────────────────────
-function startPolling() { stopPolling(); state_pollTimer = setInterval(loadMessages, 3000); S.pollTimer = state_pollTimer; }
-function stopPolling()  { if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer=null; } }
-
-async function loadMessages() {
-    if (!S.active || !S.myEmail || !S.apiKey) return;
-    const {ok, data} = await api(`/api/get_messages?user=${encodeURIComponent(S.myEmail)}&contact=${encodeURIComponent(S.active)}`);
-    if (!ok || !Array.isArray(data)) return;
-
-    const decoded = await Promise.all(data.map(async row => {
-        let p; try { p = typeof row.payload==='string' ? JSON.parse(row.payload) : row.payload; } catch { return null; }
-        if (p.from===S.myEmail) return { from:p.from, text:p.plaintext, cipher:p.ciphertext, ts:shortTs(row.timestamp) };
-        const {ok:dok, data:dd} = await api('/v1/decrypt', {
-            method:'POST', headers:{ Authorization:'Bearer '+S.apiKey },
-            body: JSON.stringify({ ciphertext:p.ciphertext, nonce:p.nonce, encryption_key:p.encryption_key })
-        });
-        return { from:p.from, text:dok?dd.plaintext:'[Decryption failed]', cipher:p.ciphertext, ts:shortTs(row.timestamp) };
-    }));
-
-    const valid = decoded.filter(Boolean);
-    const prev  = S.messages[S.active]||[];
-    if (valid.length > prev.length && document.hidden) {
-        const newIncoming = valid.slice(prev.length).filter(m=>m.from!==S.myEmail).length;
-        if (newIncoming) { S.unread[S.active]=(S.unread[S.active]||0)+newIncoming; renderContacts(); }
-    }
-    S.messages[S.active] = valid;
-    renderMessages();
-}
-
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && S.active) { S.unread[S.active]=0; renderContacts(); }
-});
-</script>
-</body>
-</html>"""
-
-
-@app.route("/chat")
-def burnchat():
-    return render_template_string(BURNCHAT_HTML)
-
-
-# ════════════════════════════════════════════════════════════════
-#  MAIN DASHBOARD  (served at /)
-# ════════════════════════════════════════════════════════════════
-
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ChaosKey — Encryption from Physical Entropy</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BurnChat</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Instrument+Serif:ital@0;1&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Fira+Code:wght@300;400;500&family=Lora:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
 <style>
+/* ── Reset & Tokens ──────────────────────────────────────────────────── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--ink:#08090c;--ink2:#0f1117;--ink3:#161b26;--line:#1e2535;--line2:#252d3e;--dust:#384158;--mist:#5a6a8a;--fog:#8898b8;--paper:#c5cede;--white:#eef2fb;--lime:#b8f552;--lime2:#d4ff7a;--lime3:rgba(184,245,82,.12);--teal:#52e5c8;--rose:#ff6b8a;--glow-lime:0 0 40px rgba(184,245,82,.25)}
-html{scroll-behavior:smooth;-webkit-font-smoothing:antialiased}
-body{background:var(--ink);color:var(--paper);font-family:'Outfit',sans-serif;font-weight:400;min-height:100vh;overflow-x:hidden}
-::selection{background:var(--lime);color:#000}
-#entropy-canvas{position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;opacity:.45}
-.wrap{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:0 2rem}
-nav{display:flex;align-items:center;justify-content:space-between;padding:1.4rem 2.5rem;position:sticky;top:0;z-index:100;background:rgba(8,9,12,.8);backdrop-filter:blur(20px);border-bottom:1px solid var(--line)}
-.nav-logo{display:flex;align-items:center;gap:.75rem;font-family:'DM Mono',monospace;font-size:.95rem;color:var(--white);font-weight:500;text-decoration:none}
-.logo-hex{width:34px;height:34px;background:linear-gradient(135deg,var(--lime),var(--teal));clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0}
-.nav-right{display:flex;align-items:center;gap:.75rem}
-.nav-status{display:flex;align-items:center;gap:.5rem;font-family:'DM Mono',monospace;font-size:.72rem;color:var(--mist);padding:.35rem .9rem;border:1px solid var(--line2);border-radius:100px}
-.nav-status.live{color:var(--lime);border-color:rgba(184,245,82,.3)}
-.pulse-dot{width:6px;height:6px;border-radius:50%;background:var(--dust)}
-.pulse-dot.live{background:var(--lime);box-shadow:0 0 8px var(--lime);animation:blink 2s ease-in-out infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
-.nav-chat-btn{font-family:'DM Mono',monospace;font-size:.72rem;color:var(--lime);padding:.35rem .9rem;border:1px solid rgba(184,245,82,.3);border-radius:100px;background:rgba(184,245,82,.06);cursor:pointer;text-decoration:none;transition:all .2s}
-.nav-chat-btn:hover{background:rgba(184,245,82,.15)}
-.hero{padding:7rem 0 5rem;text-align:center}
-.hero-eyebrow{display:inline-flex;align-items:center;gap:.6rem;font-family:'DM Mono',monospace;font-size:.72rem;color:var(--lime);letter-spacing:.12em;text-transform:uppercase;padding:.4rem 1.1rem;border:1px solid rgba(184,245,82,.25);border-radius:100px;background:rgba(184,245,82,.06);margin-bottom:2.5rem}
-h1{font-family:'Instrument Serif',serif;font-size:clamp(3.2rem,7.5vw,6rem);line-height:1.02;letter-spacing:-.03em;color:var(--white);margin-bottom:1.75rem;font-weight:400}
-h1 em{font-style:italic;background:linear-gradient(125deg,var(--lime) 0%,var(--teal) 55%,var(--lime2) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.hero-lead{font-size:1.1rem;line-height:1.75;color:var(--mist);max-width:560px;margin:0 auto 3.5rem;font-weight:300}
-.hero-cta{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;margin-bottom:3rem}
-.cta-primary{display:inline-flex;align-items:center;gap:.5rem;padding:.9rem 2rem;background:var(--lime);color:#000;border:none;border-radius:10px;font-family:'Outfit',sans-serif;font-weight:700;font-size:1rem;cursor:pointer;text-decoration:none;transition:background .2s,transform .15s}
-.cta-primary:hover{background:var(--lime2);transform:translateY(-2px)}
-.cta-ghost{display:inline-flex;align-items:center;gap:.5rem;padding:.9rem 2rem;background:none;color:var(--white);border:1px solid var(--line2);border-radius:10px;font-family:'Outfit',sans-serif;font-weight:500;font-size:1rem;text-decoration:none;transition:all .2s}
-.cta-ghost:hover{border-color:var(--fog)}
-.stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:16px;overflow:hidden;margin:4rem 0}
-.stat-cell{background:var(--ink2);padding:2rem;text-align:center}
-.stat-n{font-family:'Instrument Serif',serif;font-size:2.8rem;color:var(--white);line-height:1;margin-bottom:.4rem}
-.stat-l{font-size:.75rem;color:var(--mist);text-transform:uppercase;letter-spacing:.08em}
-footer{border-top:1px solid var(--line);padding:2.5rem;display:flex;align-items:center;justify-content:space-between;color:var(--dust);font-size:.8rem;flex-wrap:wrap;gap:1rem}
-@media(max-width:600px){h1{font-size:2.8rem}.stats-row{grid-template-columns:1fr}nav{padding:1rem 1.25rem}}
+:root{
+  --void:#060608;
+  --coal:#0d0e13;
+  --ash:#181a22;
+  --cinder:#22252f;
+  --smoke:#2e3140;
+  --dust:#4a4f61;
+  --fog:#6b7182;
+  --mist:#9097a8;
+  --paper:#c8ccdb;
+  --snow:#eef0f6;
+
+  --ember:#ff6b35;
+  --flame:#ff8c42;
+  --glow:#ffb347;
+  --spark:#ffd166;
+  --cold:#4ecdc4;
+  --ice:#a8e6cf;
+
+  --ember-dim:rgba(255,107,53,.12);
+  --ember-mid:rgba(255,107,53,.25);
+  --ember-glow:0 0 30px rgba(255,107,53,.3);
+  --cold-glow:0 0 20px rgba(78,205,196,.2);
+
+  --r-sm:8px;
+  --r-md:14px;
+  --r-lg:20px;
+  --r-xl:28px;
+}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;height:100%;overflow:hidden}
+
+/* ── Scrollbar ───────────────────────────────────────────────────────── */
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--smoke);border-radius:2px}
+
+/* ══════════════════════════════════════════════════════
+   AUTH SCREEN
+══════════════════════════════════════════════════════ */
+#auth{
+  position:fixed;inset:0;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--void);
+  z-index:100;
+}
+#auth.hidden{display:none}
+
+.auth-bg{
+  position:absolute;inset:0;
+  background:
+    radial-gradient(ellipse 80% 60% at 20% 80%, rgba(255,107,53,.07) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 50% at 80% 20%, rgba(78,205,196,.05) 0%, transparent 50%);
+  pointer-events:none;
+}
+.auth-noise{
+  position:absolute;inset:0;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  pointer-events:none;opacity:.4;
+}
+
+.auth-card{
+  position:relative;
+  width:100%;max-width:420px;
+  padding:3rem 2.5rem;
+  background:var(--coal);
+  border:1px solid var(--cinder);
+  border-radius:var(--r-xl);
+  box-shadow:0 40px 80px rgba(0,0,0,.6);
+  animation:riseIn .5s cubic-bezier(.22,1,.36,1) both;
+}
+@keyframes riseIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+
+.auth-wordmark{
+  display:flex;align-items:center;gap:12px;
+  margin-bottom:2.5rem;
+}
+.burn-icon{
+  width:42px;height:42px;
+  background:linear-gradient(135deg,var(--ember),var(--glow));
+  border-radius:12px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.3rem;
+  box-shadow:var(--ember-glow);
+  flex-shrink:0;
+}
+.wordmark-text h1{
+  font-size:1.5rem;font-weight:800;
+  letter-spacing:-.03em;color:var(--snow);
+}
+.wordmark-text p{
+  font-family:'Fira Code',monospace;
+  font-size:.65rem;color:var(--fog);
+  letter-spacing:.06em;margin-top:1px;
+}
+
+.auth-tabs{
+  display:flex;gap:4px;
+  background:var(--ash);border-radius:10px;padding:4px;
+  margin-bottom:1.75rem;
+}
+.auth-tab{
+  flex:1;padding:.55rem;
+  background:none;border:none;
+  font-family:'Syne',sans-serif;font-size:.82rem;font-weight:600;
+  color:var(--fog);cursor:pointer;
+  border-radius:7px;transition:all .2s;
+}
+.auth-tab.active{background:var(--cinder);color:var(--snow)}
+
+.form-field{margin-bottom:1rem}
+.form-field label{
+  display:block;
+  font-family:'Fira Code',monospace;font-size:.68rem;
+  color:var(--fog);letter-spacing:.06em;text-transform:uppercase;
+  margin-bottom:.45rem;
+}
+.form-field input{
+  width:100%;padding:.75rem 1rem;
+  background:var(--ash);border:1px solid var(--smoke);border-radius:var(--r-sm);
+  color:var(--snow);font-family:'Syne',sans-serif;font-size:.92rem;
+  outline:none;transition:border-color .2s,box-shadow .2s;
+}
+.form-field input::placeholder{color:var(--dust)}
+.form-field input:focus{border-color:var(--ember);box-shadow:0 0 0 3px rgba(255,107,53,.12)}
+
+.auth-submit{
+  width:100%;padding:.85rem;margin-top:.5rem;
+  background:linear-gradient(135deg,var(--ember),var(--flame));
+  color:#fff;border:none;border-radius:var(--r-sm);
+  font-family:'Syne',sans-serif;font-weight:700;font-size:.95rem;
+  cursor:pointer;letter-spacing:.01em;
+  transition:all .2s;box-shadow:0 4px 20px rgba(255,107,53,.3);
+}
+.auth-submit:hover{transform:translateY(-1px);box-shadow:0 8px 30px rgba(255,107,53,.4)}
+.auth-submit:disabled{opacity:.4;cursor:not-allowed;transform:none}
+
+.auth-err{
+  font-family:'Fira Code',monospace;font-size:.75rem;
+  color:#ff8fab;text-align:center;min-height:1.2rem;
+  margin-top:.75rem;
+}
+
+/* ══════════════════════════════════════════════════════
+   CHAT SHELL
+══════════════════════════════════════════════════════ */
+#app{
+  display:flex;height:100vh;
+}
+#app.hidden{display:none}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.sidebar{
+  width:300px;flex-shrink:0;
+  background:var(--coal);border-right:1px solid var(--cinder);
+  display:flex;flex-direction:column;
+  overflow:hidden;
+}
+
+.sidebar-top{
+  padding:1.25rem 1.25rem 0;
+}
+.user-row{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:1.25rem;
+}
+.user-chip{
+  display:flex;align-items:center;gap:10px;
+}
+.avatar{
+  width:34px;height:34px;border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:.85rem;color:#fff;
+  flex-shrink:0;
+}
+.user-meta .uname{
+  font-size:.88rem;font-weight:700;color:var(--snow);
+}
+.user-meta .uemail{
+  font-family:'Fira Code',monospace;font-size:.65rem;color:var(--fog);
+}
+.logout-btn{
+  background:none;border:none;
+  font-family:'Fira Code',monospace;font-size:.68rem;
+  color:var(--dust);cursor:pointer;
+  padding:.3rem .6rem;border-radius:6px;
+  transition:color .2s,background .2s;
+}
+.logout-btn:hover{color:var(--ember);background:var(--ember-dim)}
+
+.search-wrap{
+  position:relative;margin-bottom:1.25rem;
+}
+.search-wrap input{
+  width:100%;padding:.6rem .9rem .6rem 2.4rem;
+  background:var(--ash);border:1px solid var(--smoke);border-radius:10px;
+  color:var(--snow);font-family:'Syne',sans-serif;font-size:.85rem;
+  outline:none;transition:border-color .2s;
+}
+.search-wrap input:focus{border-color:var(--ember)}
+.search-wrap input::placeholder{color:var(--dust)}
+.search-icon{
+  position:absolute;left:.8rem;top:50%;transform:translateY(-50%);
+  font-size:.85rem;pointer-events:none;color:var(--fog);
+}
+.search-results{
+  position:absolute;top:calc(100% + 4px);left:0;right:0;
+  background:var(--cinder);border:1px solid var(--smoke);border-radius:10px;
+  overflow:hidden;z-index:50;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);
+  display:none;
+}
+.search-results.open{display:block}
+.search-result-item{
+  display:flex;align-items:center;gap:10px;
+  padding:.7rem 1rem;cursor:pointer;
+  transition:background .15s;
+}
+.search-result-item:hover{background:var(--smoke)}
+.sr-info .sr-name{font-size:.85rem;font-weight:600;color:var(--snow)}
+.sr-info .sr-email{font-family:'Fira Code',monospace;font-size:.65rem;color:var(--fog)}
+
+.sidebar-label{
+  font-family:'Fira Code',monospace;font-size:.65rem;
+  color:var(--dust);letter-spacing:.08em;text-transform:uppercase;
+  padding:0 1.25rem .5rem;
+}
+
+.thread-list{
+  flex:1;overflow-y:auto;
+  padding:0 .5rem .5rem;
+}
+.thread-item{
+  display:flex;align-items:center;gap:10px;
+  padding:.75rem .75rem;border-radius:12px;
+  cursor:pointer;transition:background .15s;
+  margin-bottom:2px;
+}
+.thread-item:hover{background:var(--ash)}
+.thread-item.active{background:var(--ember-dim);border:1px solid var(--ember-mid)}
+.thread-item.active .thread-name{color:var(--glow)}
+.thread-info{flex:1;min-width:0}
+.thread-name{
+  font-size:.9rem;font-weight:600;color:var(--snow);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.thread-email{
+  font-family:'Fira Code',monospace;font-size:.62rem;color:var(--fog);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.thread-time{
+  font-family:'Fira Code',monospace;font-size:.62rem;color:var(--dust);flex-shrink:0;
+}
+.no-threads{
+  padding:2rem 1rem;text-align:center;
+  color:var(--dust);font-size:.82rem;line-height:1.6;
+}
+.no-threads .nt-icon{font-size:2rem;margin-bottom:.5rem}
+
+/* ── Main panel ──────────────────────────────────────────────────────── */
+.main{
+  flex:1;display:flex;flex-direction:column;
+  background:var(--void);overflow:hidden;
+  position:relative;
+}
+
+.empty-state{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:.75rem;color:var(--dust);
+  text-align:center;padding:2rem;
+}
+.es-icon{font-size:3rem;margin-bottom:.5rem;opacity:.4}
+.es-title{font-size:1.1rem;font-weight:700;color:var(--fog)}
+.es-sub{font-family:'Fira Code',monospace;font-size:.75rem;line-height:1.6}
+
+.chat-view{
+  display:none;flex-direction:column;height:100%;
+}
+.chat-view.active{display:flex}
+
+/* Chat header */
+.chat-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:1rem 1.5rem;
+  background:var(--coal);border-bottom:1px solid var(--cinder);
+  flex-shrink:0;
+}
+.chat-header-left{display:flex;align-items:center;gap:12px}
+.contact-info .cname{
+  font-size:.95rem;font-weight:700;color:var(--snow);
+}
+.contact-info .cemail{
+  font-family:'Fira Code',monospace;font-size:.65rem;color:var(--fog);
+  margin-top:1px;
+}
+.enc-badge{
+  display:flex;align-items:center;gap:5px;
+  font-family:'Fira Code',monospace;font-size:.65rem;
+  color:var(--cold);padding:.2rem .55rem;
+  background:rgba(78,205,196,.08);border:1px solid rgba(78,205,196,.2);
+  border-radius:100px;
+}
+.burn-thread-btn{
+  display:flex;align-items:center;gap:6px;
+  padding:.45rem .9rem;border-radius:8px;
+  background:rgba(255,90,90,.1);border:1px solid rgba(255,90,90,.2);
+  color:#ff8fab;font-family:'Syne',sans-serif;font-size:.78rem;font-weight:600;
+  cursor:pointer;transition:all .2s;
+}
+.burn-thread-btn:hover{background:rgba(255,90,90,.2);color:#ff6b6b}
+
+/* Messages area */
+.messages{
+  flex:1;overflow-y:auto;
+  padding:1.5rem;display:flex;flex-direction:column;gap:.75rem;
+}
+.day-divider{
+  display:flex;align-items:center;gap:1rem;
+  margin:.5rem 0;
+}
+.day-divider span{
+  font-family:'Fira Code',monospace;font-size:.65rem;
+  color:var(--dust);white-space:nowrap;
+}
+.day-divider::before,.day-divider::after{
+  content:'';flex:1;height:1px;background:var(--cinder);
+}
+
+.msg-group{display:flex;flex-direction:column;gap:3px;max-width:70%}
+.msg-group.mine{align-self:flex-end;align-items:flex-end}
+.msg-group.theirs{align-self:flex-start;align-items:flex-start}
+
+.bubble{
+  padding:.65rem 1rem;
+  font-family:'Lora',serif;font-size:.9rem;line-height:1.6;
+  word-break:break-word;
+  position:relative;
+}
+.mine .bubble{
+  background:linear-gradient(135deg,var(--ember),var(--flame));
+  color:#fff;border-radius:18px 18px 4px 18px;
+}
+.theirs .bubble{
+  background:var(--ash);border:1px solid var(--cinder);
+  color:var(--snow);border-radius:18px 18px 18px 4px;
+}
+
+.cipher-bar{
+  font-family:'Fira Code',monospace;font-size:.58rem;
+  color:var(--ember);opacity:.5;
+  max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding:0 .25rem;cursor:help;
+  transition:opacity .2s;
+}
+.cipher-bar:hover{opacity:1}
+
+.msg-meta{
+  font-family:'Fira Code',monospace;font-size:.6rem;
+  color:var(--dust);padding:0 .3rem;
+}
+
+/* Compose */
+.compose{
+  padding:1rem 1.5rem;
+  background:var(--coal);border-top:1px solid var(--cinder);
+  display:flex;gap:.75rem;align-items:flex-end;
+  flex-shrink:0;
+}
+.compose-wrap{
+  flex:1;background:var(--ash);
+  border:1px solid var(--smoke);border-radius:14px;
+  overflow:hidden;transition:border-color .2s,box-shadow .2s;
+}
+.compose-wrap:focus-within{
+  border-color:var(--ember);
+  box-shadow:0 0 0 3px rgba(255,107,53,.1);
+}
+.compose-input{
+  width:100%;padding:.8rem 1rem;
+  background:none;border:none;
+  color:var(--snow);font-family:'Lora',serif;font-size:.9rem;
+  outline:none;resize:none;
+  max-height:120px;line-height:1.5;
+}
+.compose-input::placeholder{color:var(--dust)}
+.send-btn{
+  width:44px;height:44px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--ember),var(--flame));
+  border:none;border-radius:12px;
+  color:#fff;font-size:1.1rem;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .2s;
+  box-shadow:0 4px 12px rgba(255,107,53,.3);
+}
+.send-btn:hover{transform:scale(1.05);box-shadow:0 6px 20px rgba(255,107,53,.45)}
+.send-btn:disabled{opacity:.35;cursor:not-allowed;transform:none}
+
+/* ── Burn confirmation modal ─────────────────────────────────────────── */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.7);
+  display:flex;align-items:center;justify-content:center;
+  z-index:200;opacity:0;pointer-events:none;transition:opacity .2s;
+}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal{
+  background:var(--coal);border:1px solid var(--cinder);border-radius:var(--r-xl);
+  padding:2rem 2.25rem;max-width:380px;width:90%;
+  box-shadow:0 40px 80px rgba(0,0,0,.6);
+  transform:scale(.95);transition:transform .2s;
+}
+.modal-overlay.open .modal{transform:scale(1)}
+.modal-icon{font-size:2.5rem;margin-bottom:1rem}
+.modal h2{font-size:1.1rem;font-weight:800;color:var(--snow);margin-bottom:.5rem}
+.modal p{font-family:'Fira Code',monospace;font-size:.75rem;color:var(--fog);line-height:1.6;margin-bottom:1.5rem}
+.modal-btns{display:flex;gap:.75rem}
+.modal-cancel,.modal-confirm{
+  flex:1;padding:.7rem;border-radius:10px;border:none;
+  font-family:'Syne',sans-serif;font-weight:700;font-size:.88rem;cursor:pointer;
+  transition:all .15s;
+}
+.modal-cancel{background:var(--ash);color:var(--paper);border:1px solid var(--smoke)}
+.modal-cancel:hover{border-color:var(--fog)}
+.modal-confirm{
+  background:linear-gradient(135deg,#ff4444,#ff6b35);
+  color:#fff;box-shadow:0 4px 15px rgba(255,60,60,.3);
+}
+.modal-confirm:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(255,60,60,.4)}
+
+/* ── Toast ───────────────────────────────────────────────────────────── */
+.toast{
+  position:fixed;bottom:2rem;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--cinder);color:var(--snow);
+  font-family:'Fira Code',monospace;font-size:.78rem;
+  padding:.65rem 1.25rem;border-radius:100px;
+  border:1px solid var(--smoke);
+  opacity:0;transition:opacity .25s,transform .25s;
+  pointer-events:none;z-index:300;white-space:nowrap;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.ok{border-color:rgba(168,230,207,.3);color:var(--ice)}
+.toast.err{border-color:rgba(255,107,53,.3);color:var(--ember)}
+
+/* ── Responsive ──────────────────────────────────────────────────────── */
+@media(max-width:680px){
+  .sidebar{width:100%;display:none}
+  .sidebar.mobile-open{display:flex;position:fixed;inset:0;z-index:50}
+}
 </style>
 </head>
 <body>
-<canvas id="entropy-canvas"></canvas>
-<nav>
-  <a href="/" class="nav-logo"><div class="logo-hex">⬡</div>ChaosKey</a>
-  <div class="nav-right">
-    <div class="nav-status" id="nav-pill"><div class="pulse-dot" id="nav-dot"></div><span id="nav-txt">checking…</span></div>
-    <a href="/chat" class="nav-chat-btn">🔥 BurnChat</a>
-  </div>
-</nav>
-<div class="wrap">
-  <section class="hero">
-    <div class="hero-eyebrow">◈ Physical Entropy · AES-256-GCM · 10s Key Rotation</div>
-    <h1>Your encryption key<br>born from <em>real chaos</em></h1>
-    <p class="hero-lead">A camera watches a moving pendulum. A microphone listens to the room.<br><strong>That unpredictable motion derives a NEW cryptographic key every 10 seconds</strong> — generated locally, never stored in the cloud.</p>
-    <div class="hero-cta">
-      <a href="/chat" class="cta-primary">🔥 Open BurnChat →</a>
+
+<!-- ══ AUTH SCREEN ═════════════════════════════════════════════════════ -->
+<div id="auth">
+  <div class="auth-bg"></div>
+  <div class="auth-noise"></div>
+  <div class="auth-card">
+    <div class="auth-wordmark">
+      <div class="burn-icon">🔥</div>
+      <div class="wordmark-text">
+        <h1>BurnChat</h1>
+        <p>AES-256-GCM · MESSAGES SELF-DESTRUCT</p>
+      </div>
     </div>
-  </section>
-  <div class="stats-row">
-    <div class="stat-cell"><div class="stat-n" id="s-customers">—</div><div class="stat-l">Active users</div></div>
-    <div class="stat-cell"><div class="stat-n" id="s-today">—</div><div class="stat-l">Encryptions today</div></div>
-    <div class="stat-cell"><div class="stat-n">10s</div><div class="stat-l">Key Rotation Rate</div></div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-in" onclick="switchAuthTab('login')">Sign in</button>
+      <button class="auth-tab" id="tab-up" onclick="switchAuthTab('signup')">Create account</button>
+    </div>
+    <div id="auth-fields">
+      <div class="form-field" id="field-name" style="display:none">
+        <label>Display name</label>
+        <input id="f-name" type="text" placeholder="How should people know you?" autocomplete="name">
+      </div>
+      <div class="form-field">
+        <label>Email</label>
+        <input id="f-email" type="email" placeholder="you@example.com" autocomplete="email"
+          onkeydown="if(event.key==='Enter')document.getElementById('f-pw').focus()">
+      </div>
+      <div class="form-field">
+        <label>Password</label>
+        <input id="f-pw" type="password" placeholder="••••••••" autocomplete="current-password"
+          onkeydown="if(event.key==='Enter')doAuth()">
+      </div>
+    </div>
+    <button class="auth-submit" id="auth-btn" onclick="doAuth()">Sign in →</button>
+    <div class="auth-err" id="auth-err"></div>
   </div>
 </div>
-<footer>
-  <div style="display:flex;align-items:center;gap:.75rem"><div class="logo-hex" style="width:24px;height:24px;font-size:11px">⬡</div><span style="font-family:'DM Mono',monospace;font-size:.75rem;color:var(--dust)">ChaosKey</span></div>
-  <span style="font-family:'DM Mono',monospace;font-size:.65rem;color:var(--line2)">Physical entropy. Key never leaves your machine.</span>
-</footer>
+
+<!-- ══ APP SHELL ═══════════════════════════════════════════════════════ -->
+<div id="app" class="hidden">
+
+  <!-- Sidebar -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-top">
+      <div class="user-row">
+        <div class="user-chip">
+          <div class="avatar" id="my-avatar" style="background:#ff6b35">U</div>
+          <div class="user-meta">
+            <div class="uname" id="my-name">–</div>
+            <div class="uemail" id="my-email">–</div>
+          </div>
+        </div>
+        <button class="logout-btn" onclick="doLogout()">exit</button>
+      </div>
+      <div class="search-wrap">
+        <span class="search-icon">⌕</span>
+        <input id="search-input" type="email" placeholder="Find user by email…"
+          oninput="onSearchInput(this.value)"
+          onblur="setTimeout(()=>closeSearch(),150)">
+        <div class="search-results" id="search-results"></div>
+      </div>
+    </div>
+    <div class="sidebar-label">Conversations</div>
+    <div class="thread-list" id="thread-list">
+      <div class="no-threads">
+        <div class="nt-icon">🔒</div>
+        <div>Search for a user above<br>to start a conversation.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="empty-state" id="empty-state">
+      <div class="es-icon">🔥</div>
+      <div class="es-title">Select a conversation</div>
+      <div class="es-sub">
+        Messages are encrypted with AES-256-GCM<br>
+        powered by ChaosKey physical entropy
+      </div>
+    </div>
+
+    <div class="chat-view" id="chat-view">
+      <div class="chat-header">
+        <div class="chat-header-left">
+          <div class="avatar" id="contact-avatar" style="background:#888">C</div>
+          <div class="contact-info">
+            <div class="cname" id="contact-name">–</div>
+            <div class="cemail" id="contact-email">–</div>
+          </div>
+          <div class="enc-badge">⚿ AES-256-GCM</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:.75rem">
+          <button class="burn-thread-btn" onclick="confirmBurn()">🔥 Burn thread</button>
+        </div>
+      </div>
+
+      <div class="messages" id="messages-area"></div>
+
+      <div class="compose">
+        <div class="compose-wrap">
+          <textarea class="compose-input" id="compose-input" rows="1"
+            placeholder="Write an encrypted message… (Enter to send)"
+            oninput="autoResize(this)"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}">
+          </textarea>
+        </div>
+        <button class="send-btn" id="send-btn" onclick="sendMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Burn confirmation modal -->
+<div class="modal-overlay" id="burn-modal">
+  <div class="modal">
+    <div class="modal-icon">🔥</div>
+    <h2>Burn this thread?</h2>
+    <p id="burn-modal-text">This will permanently delete all messages. The ashes will never be recovered.</p>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeBurnModal()">Cancel</button>
+      <button class="modal-confirm" onclick="executeBurn()">Burn it</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
 <script>
-(function(){const cv=document.getElementById('entropy-canvas');const cx=cv.getContext('2d');let W,H,P=[];function resize(){W=cv.width=innerWidth;H=cv.height=innerHeight}resize();addEventListener('resize',resize);class Particle{constructor(){this.reset(true)}reset(i){this.x=Math.random()*W;this.y=i?Math.random()*H:(Math.random()<.5?-4:H+4);this.vx=(Math.random()-.5)*.4;this.vy=(Math.random()*.6+.2)*.4*(this.y<0?1:-1);this.r=Math.random()*1.5+.4;this.life=0;this.maxLife=300+Math.random()*400;this.hue=Math.random()<.6?150:175}step(){const t=Date.now()*.0003,nx=this.x/W*4+t,ny=this.y/H*4+t*.7,a=(Math.sin(nx)*Math.cos(ny))*Math.PI*2;this.vx+=Math.cos(a)*.008;this.vy+=Math.sin(a)*.008;this.vx*=.98;this.vy*=.98;this.x+=this.vx;this.y+=this.vy;this.life++;if(this.life>this.maxLife||this.x<-10||this.x>W+10||this.y<-10||this.y>H+10)this.reset(false)}draw(){const a=Math.min(this.life/60,1)*Math.min((this.maxLife-this.life)/60,1)*.6;cx.beginPath();cx.arc(this.x,this.y,this.r,0,Math.PI*2);cx.fillStyle=`hsla(${this.hue},90%,65%,${a})`;cx.fill()}}
-for(let i=0;i<90;i++)P.push(new Particle());function draw(){cx.clearRect(0,0,W,H);for(let i=0;i<P.length;i++)for(let j=i+1;j<P.length;j++){const dx=P[i].x-P[j].x,dy=P[i].y-P[j].y,d=Math.sqrt(dx*dx+dy*dy);if(d<120){cx.beginPath();cx.moveTo(P[i].x,P[i].y);cx.lineTo(P[j].x,P[j].y);cx.strokeStyle=`rgba(184,245,82,${(1-d/120)*.07})`;cx.lineWidth=.5;cx.stroke()}}P.forEach(p=>{p.step();p.draw()});requestAnimationFrame(draw)}draw()})();
-async function poll(){try{const d=await(await fetch('/health')).json(),dot=document.getElementById('nav-dot'),pill=document.getElementById('nav-pill'),txt=document.getElementById('nav-txt');if(d.tunnel_active){dot.classList.add('live');pill.classList.add('live');txt.textContent='Engine online'}else{dot.classList.remove('live');pill.classList.remove('live');txt.textContent='Engine offline'}const s=await(await fetch('/public/stats')).json();document.getElementById('s-customers').textContent=s.total_customers??'—';document.getElementById('s-today').textContent=s.today_requests??'—'}catch(e){}}
-poll();setInterval(poll,6000);
+// ════════════════════════════════════════════════════════════════
+//  State
+// ════════════════════════════════════════════════════════════════
+const S = {
+  me:          null,   // { email, name, color }
+  activeContact: null, // { email, name, color }
+  threads:     [],
+  pollTimer:   null,
+  authMode:    'login',
+};
+
+// ════════════════════════════════════════════════════════════════
+//  Utilities
+// ════════════════════════════════════════════════════════════════
+const $  = id => document.getElementById(id);
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const initials = s => (s||'?')[0].toUpperCase();
+
+function toast(msg, type='ok', dur=2800) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = `toast ${type} show`;
+  setTimeout(() => el.classList.remove('show'), dur);
+}
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {
+    credentials: 'same-origin',
+    headers: {'Content-Type':'application/json', ...(opts.headers||{})},
+    ...opts,
+  });
+  const ct = r.headers.get('Content-Type') || '';
+  const data = ct.includes('json') ? await r.json() : {error: 'Server error'};
+  return {ok: r.ok, status: r.status, data};
+}
+
+function autoResize(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+}
+
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return 'Today';
+  const yesterday = new Date(now); yesterday.setDate(now.getDate()-1);
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString([], {month:'short', day:'numeric'});
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Auth
+// ════════════════════════════════════════════════════════════════
+function switchAuthTab(mode) {
+  S.authMode = mode;
+  $('tab-in').classList.toggle('active', mode==='login');
+  $('tab-up').classList.toggle('active', mode==='signup');
+  $('field-name').style.display = mode==='signup' ? 'block' : 'none';
+  $('auth-btn').textContent = mode==='login' ? 'Sign in →' : 'Create account →';
+  $('auth-err').textContent = '';
+}
+
+async function doAuth() {
+  const email = $('f-email').value.trim().toLowerCase();
+  const pw    = $('f-pw').value;
+  const name  = $('f-name').value.trim();
+  const err   = $('auth-err');
+  const btn   = $('auth-btn');
+  if (!email) { err.textContent = '⚠ Email required'; return; }
+  if (!pw)    { err.textContent = '⚠ Password required'; return; }
+  btn.disabled = true;
+  err.textContent = '';
+
+  const path = S.authMode === 'signup' ? '/auth/signup' : '/auth/login';
+  const body = S.authMode === 'signup'
+    ? {email, password:pw, name}
+    : {email, password:pw};
+
+  const {ok, data} = await api(path, {method:'POST', body:JSON.stringify(body)});
+  if (ok) {
+    S.me = {email:data.email, name:data.name, color:data.color};
+    enterApp();
+  } else {
+    err.textContent = '⚠ ' + (data.error || 'Authentication failed');
+    btn.disabled = false;
+  }
+}
+
+async function doLogout() {
+  await api('/auth/logout', {method:'POST'});
+  S.me = null; S.activeContact = null;
+  clearInterval(S.pollTimer);
+  $('app').classList.add('hidden');
+  $('auth').classList.remove('hidden');
+  $('auth-btn').disabled = false;
+  $('f-pw').value = '';
+  $('auth-err').textContent = '';
+}
+
+async function checkSession() {
+  const {ok, data} = await api('/auth/me');
+  if (ok && data.authenticated) {
+    S.me = {email:data.email, name:data.name, color:data.color};
+    enterApp();
+  }
+}
+
+function enterApp() {
+  $('auth').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  // Fill user info
+  const av = $('my-avatar');
+  av.textContent = initials(S.me.name);
+  av.style.background = S.me.color;
+  $('my-name').textContent = S.me.name;
+  $('my-email').textContent = S.me.email;
+  // Load inbox
+  loadInbox();
+  S.pollTimer = setInterval(() => {
+    loadInbox();
+    if (S.activeContact) loadThread(S.activeContact.email, false);
+  }, 3500);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Inbox / Threads
+// ════════════════════════════════════════════════════════════════
+async function loadInbox() {
+  const {ok, data} = await api('/msg/inbox');
+  if (!ok || !Array.isArray(data)) return;
+  S.threads = data;
+  renderThreadList();
+}
+
+function renderThreadList() {
+  const el = $('thread-list');
+  if (!S.threads.length) {
+    el.innerHTML = `<div class="no-threads"><div class="nt-icon">🔒</div>Search for a user above<br>to start a conversation.</div>`;
+    return;
+  }
+  el.innerHTML = S.threads.map(t => `
+    <div class="thread-item ${S.activeContact?.email === t.contact ? 'active' : ''}"
+         onclick="openThread('${t.contact}','${esc(t.name)}','${t.color}')">
+      <div class="avatar" style="background:${t.color}">${initials(t.name)}</div>
+      <div class="thread-info">
+        <div class="thread-name">${esc(t.name)}</div>
+        <div class="thread-email">${esc(t.contact)}</div>
+      </div>
+      <div class="thread-time">${fmtDate(t.last_at)}</div>
+    </div>`).join('');
+}
+
+function openThread(email, name, color) {
+  S.activeContact = {email, name: decodeURIComponent(name), color};
+  // Update header
+  const av = $('contact-avatar');
+  av.textContent = initials(S.activeContact.name);
+  av.style.background = color;
+  $('contact-name').textContent = S.activeContact.name;
+  $('contact-email').textContent = email;
+  // Show chat view
+  $('empty-state').style.display = 'none';
+  $('chat-view').classList.add('active');
+  renderThreadList();
+  loadThread(email, true);
+}
+
+async function loadThread(email, scrollToBottom=true) {
+  const {ok, data} = await api(`/msg/thread?with=${encodeURIComponent(email)}`);
+  if (!ok || !Array.isArray(data)) return;
+
+  const area = $('messages-area');
+  if (!data.length) {
+    area.innerHTML = `
+      <div style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.5rem;color:var(--dust);text-align:center;">
+        <div style="font-size:1.8rem">🔐</div>
+        <div style="font-family:'Fira Code',monospace;font-size:.78rem">No messages yet. Say hello!</div>
+      </div>`;
+    return;
+  }
+
+  // Group by date
+  let html = '';
+  let lastDate = '';
+  for (const m of data) {
+    const d = fmtDate(m.sent_at);
+    if (d !== lastDate) {
+      html += `<div class="day-divider"><span>${d}</span></div>`;
+      lastDate = d;
+    }
+    const mine = m.from === S.me.email;
+    html += `
+      <div class="msg-group ${mine ? 'mine' : 'theirs'}">
+        <div class="bubble">${esc(m.text)}</div>
+        ${m.cipher ? `<div class="cipher-peek" title="${esc(m.cipher)}">⚿ ${esc(m.cipher)}</div>` : ''}
+        <div class="msg-meta">${fmtTime(m.sent_at)}</div>
+      </div>`;
+  }
+  // Only update DOM if content changed (avoids scroll jump on poll)
+  if (area.dataset.hash !== btoa(unescape(encodeURIComponent(html))).slice(0,20)) {
+    area.innerHTML = html;
+    area.dataset.hash = btoa(unescape(encodeURIComponent(html))).slice(0,20);
+    if (scrollToBottom) area.scrollTop = area.scrollHeight;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Send
+// ════════════════════════════════════════════════════════════════
+async function sendMessage() {
+  const inp = $('compose-input');
+  const txt = inp.value.trim();
+  if (!txt || !S.activeContact) return;
+  const btn = $('send-btn');
+  btn.disabled = true;
+
+  const {ok, data} = await api('/msg/send', {
+    method: 'POST',
+    body: JSON.stringify({recipient: S.activeContact.email, plaintext: txt}),
+  });
+
+  inp.value = ''; inp.style.height = 'auto';
+  btn.disabled = false;
+
+  if (!ok) {
+    toast('✗ ' + (data.error || 'Send failed'), 'err');
+    return;
+  }
+
+  // Refresh thread + inbox
+  await loadThread(S.activeContact.email, true);
+  loadInbox();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Burn
+// ════════════════════════════════════════════════════════════════
+function confirmBurn() {
+  if (!S.activeContact) return;
+  $('burn-modal-text').textContent =
+    `All messages with ${S.activeContact.name} will be permanently deleted. This cannot be undone.`;
+  $('burn-modal').classList.add('open');
+}
+function closeBurnModal() {
+  $('burn-modal').classList.remove('open');
+}
+async function executeBurn() {
+  closeBurnModal();
+  if (!S.activeContact) return;
+  const {ok, data} = await api('/msg/burn', {
+    method: 'POST',
+    body: JSON.stringify({contact: S.activeContact.email}),
+  });
+  if (ok) {
+    toast('🔥 Thread burned', 'ok');
+    await loadThread(S.activeContact.email, false);
+    loadInbox();
+  } else {
+    toast('✗ ' + (data.error || 'Burn failed'), 'err');
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  User search
+// ════════════════════════════════════════════════════════════════
+let _searchTimer = null;
+function onSearchInput(val) {
+  clearTimeout(_searchTimer);
+  if (val.length < 3) { closeSearch(); return; }
+  _searchTimer = setTimeout(() => searchUsers(val), 300);
+}
+async function searchUsers(q) {
+  const {ok, data} = await api(`/msg/search_user?q=${encodeURIComponent(q)}`);
+  if (!ok || !Array.isArray(data) || !data.length) { closeSearch(); return; }
+  const el = $('search-results');
+  el.innerHTML = data.map(u => `
+    <div class="search-result-item" onclick="startChatWith('${u.email}','${encodeURIComponent(u.name)}','${u.color}')">
+      <div class="avatar" style="background:${u.color};width:30px;height:30px;font-size:.75rem">${initials(u.name)}</div>
+      <div class="sr-info">
+        <div class="sr-name">${esc(u.name)}</div>
+        <div class="sr-email">${esc(u.email)}</div>
+      </div>
+    </div>`).join('');
+  el.classList.add('open');
+}
+function closeSearch() {
+  $('search-results').classList.remove('open');
+}
+function startChatWith(email, nameEnc, color) {
+  $('search-input').value = '';
+  closeSearch();
+  const name = decodeURIComponent(nameEnc);
+  // Add to threads if not present
+  if (!S.threads.find(t => t.contact === email)) {
+    S.threads.unshift({contact:email, name, color, last_at:'', total:0});
+    renderThreadList();
+  }
+  openThread(email, nameEnc, color);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Boot
+// ════════════════════════════════════════════════════════════════
+checkSession();
 </script>
 </body>
 </html>"""
@@ -1364,14 +1310,14 @@ poll();setInterval(poll,6000);
 
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(HTML)
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
-try:
-    init_db()
-except Exception as e:
-    log.error(f"CRITICAL: Database initialization failed: {e}")
+init_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    log.info(f"BurnChat starting on port {PORT}")
+    log.info(f"ChaosKey URL: {CHAOSKEY_URL or '(not set)'}")
+    log.info(f"ChaosKey key: {'(set)' if CHAOSKEY_API_KEY else '(not set)'}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
