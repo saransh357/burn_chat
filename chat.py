@@ -1149,19 +1149,21 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
 <div class="toast" id="toast"></div>
 
 <script>
+'use strict';
+
 // ════════════════════════════════════════════════════════════════
 //  State
 // ════════════════════════════════════════════════════════════════
 const S = {
-  me:          null,   // { email, name, color }
-  activeContact: null, // { email, name, color }
-  threads:     [],
-  pollTimer:   null,
-  authMode:    'login',
+  me: null,
+  activeContact: null,
+  threads: [],
+  pollTimer: null,
+  authMode: 'login',
 };
 
 // ════════════════════════════════════════════════════════════════
-//  Utilities
+//  Utils
 // ════════════════════════════════════════════════════════════════
 const $  = id => document.getElementById(id);
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1182,7 +1184,7 @@ async function api(path, opts={}) {
   });
   const ct = r.headers.get('Content-Type') || '';
   const data = ct.includes('json') ? await r.json() : {error: 'Server error'};
-  return {ok: r.ok, status: r.status, data};
+  return {ok: r.ok, data};
 }
 
 function autoResize(ta) {
@@ -1191,22 +1193,20 @@ function autoResize(ta) {
 }
 
 function fmtTime(iso) {
-  if (!iso) return '';
   const d = new Date(iso);
   return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
 function fmtDate(iso) {
-  if (!iso) return '';
   const d = new Date(iso);
   const now = new Date();
   if (d.toDateString() === now.toDateString()) return 'Today';
-  const yesterday = new Date(now); yesterday.setDate(now.getDate()-1);
-  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  const y = new Date(now); y.setDate(now.getDate()-1);
+  if (d.toDateString() === y.toDateString()) return 'Yesterday';
   return d.toLocaleDateString([], {month:'short', day:'numeric'});
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Auth
+//  AUTH
 // ════════════════════════════════════════════════════════════════
 function switchAuthTab(mode) {
   S.authMode = mode;
@@ -1224,120 +1224,60 @@ async function doAuth() {
   const name   = $('f-name').value.trim();
   const ckKey  = $('f-ck-key').value.trim();
   const err    = $('auth-err');
-  const btn    = $('auth-btn');
-  if (!email) { err.textContent = '⚠ Email required'; return; }
-  if (!pw)    { err.textContent = '⚠ Password required'; return; }
-  if (S.authMode === 'signup' && !ckKey) {
-    err.textContent = '⚠ ChaosKey API key required'; return;
-  }
-  btn.disabled = true;
-  err.textContent = '';
 
-  const path = S.authMode === 'signup' ? '/auth/signup' : '/auth/login';
-  const body = S.authMode === 'signup'
-    ? {email, password:pw, name, chaoskey_api_key: ckKey}
+  if (!email) return err.textContent = '⚠ Email required';
+  if (!pw) return err.textContent = '⚠ Password required';
+  if (S.authMode==='signup' && !ckKey)
+    return err.textContent = '⚠ ChaosKey API key required';
+
+  const path = S.authMode==='signup'?'/auth/signup':'/auth/login';
+  const body = S.authMode==='signup'
+    ? {email, password:pw, name, chaoskey_api_key:ckKey}
     : {email, password:pw};
 
-  const {ok, data} = await api(path, {method:'POST', body:JSON.stringify(body)});
-  if (ok) {
-    S.me = {email:data.email, name:data.name, color:data.color,
-            hasKey:data.has_ck_key ?? true, keyPrefix:data.key_prefix};
-    enterApp();
-  } else {
-    err.textContent = '⚠ ' + (data.error || 'Authentication failed');
-    btn.disabled = false;
-  }
-}
+  const {ok,data} = await api(path,{method:'POST',body:JSON.stringify(body)});
+  if (!ok) return err.textContent = '⚠ ' + (data.error||'Auth failed');
 
-async function doLogout() {
-  await api('/auth/logout', {method:'POST'});
-  S.me = null; S.activeContact = null;
-  clearInterval(S.pollTimer);
-  $('app').classList.add('hidden');
-  $('auth').classList.remove('hidden');
-  $('auth-btn').disabled = false;
-  $('f-pw').value = '';
-  $('auth-err').textContent = '';
+  S.me = {email:data.email,name:data.name,color:data.color};
+  enterApp();
 }
 
 async function checkSession() {
-  const {ok, data} = await api('/auth/me');
+  const {ok,data} = await api('/auth/me');
   if (ok && data.authenticated) {
-    S.me = {email:data.email, name:data.name, color:data.color,
-            hasKey:data.has_ck_key, keyPrefix:data.key_prefix};
+    S.me = {email:data.email,name:data.name,color:data.color};
     enterApp();
   }
 }
 
-// ── Update ChaosKey key modal ─────────────────────────────────────────────
-function showUpdateKeyModal() {
-  $('modal-ck-input').value = '';
-  $('key-modal-err').textContent = '';
-  $('key-modal').classList.add('open');
-  setTimeout(() => $('modal-ck-input').focus(), 100);
-}
-function closeKeyModal() {
-  $('key-modal').classList.remove('open');
-}
-async function saveUpdatedKey() {
-  const key = $('modal-ck-input').value.trim();
-  const errEl = $('key-modal-err');
-  if (!key || !key.startsWith('ck_live_')) {
-    errEl.textContent = '⚠ Must start with ck_live_'; return;
-  }
-  const {ok, data} = await api('/auth/update_ck_key', {
-    method: 'POST',
-    body: JSON.stringify({chaoskey_api_key: key}),
-  });
-  if (ok) {
-    S.me.hasKey = true; S.me.keyPrefix = data.key_prefix;
-    $('ck-key-prefix').textContent = data.key_prefix;
-    $('ck-key-bar').style.display  = 'flex';
-    $('ck-key-warn').style.display = 'none';
-    closeKeyModal();
-    toast('⚿ ChaosKey key updated', 'ok');
-  } else {
-    errEl.textContent = '⚠ ' + (data.error || 'Failed');
-  }
-}
-
+// ════════════════════════════════════════════════════════════════
+//  APP INIT
+// ════════════════════════════════════════════════════════════════
 function enterApp() {
   $('auth').classList.add('hidden');
   $('app').classList.remove('hidden');
-  const av = $('my-avatar');
-  av.textContent = initials(S.me.name);
-  av.style.background = S.me.color;
-  $('my-name').textContent  = S.me.name;
+
+  $('my-name').textContent = S.me.name;
   $('my-email').textContent = S.me.email;
 
-  // Show ChaosKey key status in sidebar
-  if (S.me.hasKey && S.me.keyPrefix) {
-    $('ck-key-bar').style.display  = 'flex';
-    $('ck-key-warn').style.display = 'none';
-    $('ck-key-prefix').textContent = S.me.keyPrefix;
-  } else {
-    $('ck-key-bar').style.display  = 'none';
-    $('ck-key-warn').style.display = 'block';
-  }
-
   loadInbox();
-      setInterval(async () => {
-  await loadInbox();
-  if (S.activeContact) {
-    const area = $('messages-area');
-    area.dataset.hash = '';
-    await loadThread(S.activeContact.email, false);
-  }
-}, 2500);
- 
+
+  S.pollTimer = setInterval(async () => {
+    await loadInbox();
+    if (S.activeContact) {
+      const area = $('messages-area');
+      area.dataset.hash = '';
+      await loadThread(S.activeContact.email,false);
+    }
+  }, 2500);
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Inbox / Threads
+//  INBOX
 // ════════════════════════════════════════════════════════════════
 async function loadInbox() {
-  const {ok, data} = await api('/msg/inbox');
-  if (!ok || !Array.isArray(data)) return;
+  const {ok,data} = await api('/msg/inbox');
+  if (!ok) return;
   S.threads = data;
   renderThreadList();
 }
@@ -1345,84 +1285,59 @@ async function loadInbox() {
 function renderThreadList() {
   const el = $('thread-list');
   if (!S.threads.length) {
-    el.innerHTML = `<div class="no-threads"><div class="nt-icon">🔒</div>Search for a user above<br>to start a conversation.</div>`;
+    el.innerHTML = `<div class="no-threads">No conversations</div>`;
     return;
   }
-  el.innerHTML = S.threads.map(t => `
-    <div class="thread-item ${S.activeContact?.email === t.contact ? 'active' : ''}"
-         onclick="openThread('${t.contact}','${esc(t.name)}','${t.color}')">
-      <div class="avatar" style="background:${t.color}">${initials(t.name)}</div>
-      <div class="thread-info">
-        <div class="thread-name">${esc(t.name)}</div>
-        <div class="thread-email">${esc(t.contact)}</div>
+  el.innerHTML = S.threads.map(t=>`
+    <div class="thread-item"
+      onclick="openThread('${t.contact}','${t.name}','${t.color}')">
+      <div class="avatar" style="background:${t.color}">
+        ${initials(t.name)}
       </div>
-      <div class="thread-time">${fmtDate(t.last_at)}</div>
+      <div>${esc(t.name)}</div>
     </div>`).join('');
 }
 
-function openThread(email, name, color) {
-  S.activeContact = {email, name: decodeURIComponent(name), color};
-  // Update header
-  const av = $('contact-avatar');
-  av.textContent = initials(S.activeContact.name);
-  av.style.background = color;
-  $('contact-name').textContent = S.activeContact.name;
-  $('contact-email').textContent = email;
-  // Show chat view
-  $('empty-state').style.display = 'none';
+// ════════════════════════════════════════════════════════════════
+//  THREAD
+// ════════════════════════════════════════════════════════════════
+function openThread(email,name,color){
+  S.activeContact={email,name,color};
   $('chat-view').classList.add('active');
-  renderThreadList();
-  loadThread(email, true);
+  loadThread(email,true);
 }
 
-async function loadThread(email, scrollToBottom=true) {
-  const {ok, data} = await api(`/msg/thread?with=${encodeURIComponent(email)}`);
-  if (!ok || !Array.isArray(data)) return;
+async function loadThread(email,scroll=true){
+  const {ok,data} = await api(`/msg/thread?with=${email}`);
+  if (!ok) return;
 
-const area = $('messages-area');
+  const area = $('messages-area');
 
-const tempMsg = {
-  from: S.me.email,
-  text: txt,
-  sent_at: new Date().toISOString(),
-  cipher: ''
-};
-
-// Add instantly to UI
-area.innerHTML += `
-  <div class="msg-group mine">
-    <div class="bubble">${esc(tempMsg.text)}</div>
-    <div class="msg-meta">${fmtTime(tempMsg.sent_at)}</div>
-  </div>`;
-area.scrollTop = area.scrollHeight;
-
-  // Group by date
-  let html = '';
-  let lastDate = '';
-  for (const m of data) {
-    const d = fmtDate(m.sent_at);
-    if (d !== lastDate) {
-      html += `<div class="day-divider"><span>${d}</span></div>`;
-      lastDate = d;
-    }
-    const mine = m.from === S.me.email;
-    html += `
-      <div class="msg-group ${mine ? 'mine' : 'theirs'}">
+  let html='';
+  for(const m of data){
+    const mine = m.from===S.me.email;
+    html+=`
+      <div class="msg-group ${mine?'mine':'theirs'}">
         <div class="bubble">${esc(m.text)}</div>
-        ${m.cipher ? `<div class="cipher-peek" title="${esc(m.cipher)}">⚿ ${esc(m.cipher)}</div>` : ''}
         <div class="msg-meta">${fmtTime(m.sent_at)}</div>
       </div>`;
   }
-  // Only update DOM if content changed (avoids scroll jump on poll)
-  if (area.dataset.hash !== btoa(unescape(encodeURIComponent(html))).slice(0,20)) {
+
+  const newHash = btoa(unescape(encodeURIComponent(html))).slice(0,20);
+
+  if (area.dataset.hash !== newHash) {
     area.innerHTML = html;
-    area.dataset.hash = btoa(unescape(encodeURIComponent(html))).slice(0,20);
-    if (scrollToBottom) area.scrollTop = area.scrollHeight;
+    area.dataset.hash = newHash;
+    if (scroll) area.scrollTop = area.scrollHeight;
+  } else if (!area.innerHTML) {
+    // fallback fix
+    area.innerHTML = html;
+    area.dataset.hash = newHash;
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Send
+//  SEND (FIXED)
 // ════════════════════════════════════════════════════════════════
 async function sendMessage() {
   const inp = $('compose-input');
@@ -1432,103 +1347,33 @@ async function sendMessage() {
   const btn = $('send-btn');
   btn.disabled = true;
 
-  const {ok, data} = await api('/msg/send', {
-    method: 'POST',
-    body: JSON.stringify({
-      recipient: S.activeContact.email,
-      plaintext: txt
-    }),
+  const {ok,data} = await api('/msg/send',{
+    method:'POST',
+    body:JSON.stringify({
+      recipient:S.activeContact.email,
+      plaintext:txt
+    })
   });
 
   btn.disabled = false;
 
   if (!ok) {
-    const msg = data.error || 'Send failed';
-    toast('✗ ' + msg, 'err', 5000);
+    toast('✗ ' + (data.error || 'Send failed'),'err');
     return;
   }
 
-  // ✅ Clear input
-  inp.value = '';
-  inp.style.height = 'auto';
+  inp.value='';
+  inp.style.height='auto';
 
-  // ✅ FORCE inbox refresh AFTER backend commit
-  await loadInbox();
-
-  // ✅ Force thread reload
   const area = $('messages-area');
-  area.dataset.hash = ''; // bust cache
-  await loadThread(S.activeContact.email, true);
+  area.dataset.hash='';
+
+  await loadThread(S.activeContact.email,true);
+  await loadInbox();
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Burn
-// ════════════════════════════════════════════════════════════════
-function confirmBurn() {
-  if (!S.activeContact) return;
-  $('burn-modal-text').textContent =
-    `All messages with ${S.activeContact.name} will be permanently deleted. This cannot be undone.`;
-  $('burn-modal').classList.add('open');
-}
-function closeBurnModal() {
-  $('burn-modal').classList.remove('open');
-}
-async function executeBurn() {
-  closeBurnModal();
-  if (!S.activeContact) return;
-  const {ok, data} = await api('/msg/burn', {
-    method: 'POST',
-    body: JSON.stringify({contact: S.activeContact.email}),
-  });
-  if (ok) {
-    toast('🔥 Thread burned', 'ok');
-    await loadThread(S.activeContact.email, false);
-    loadInbox();
-  } else {
-    toast('✗ ' + (data.error || 'Burn failed'), 'err');
-  }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  User search
-// ════════════════════════════════════════════════════════════════
-let _searchTimer = null;
-function onSearchInput(val) {
-  clearTimeout(_searchTimer);
-  if (val.length < 3) { closeSearch(); return; }
-  _searchTimer = setTimeout(() => searchUsers(val), 300);
-}
-async function searchUsers(q) {
-  const {ok, data} = await api(`/msg/search_user?q=${encodeURIComponent(q)}`);
-  if (!ok || !Array.isArray(data) || !data.length) { closeSearch(); return; }
-  const el = $('search-results');
-  el.innerHTML = data.map(u => `
-    <div class="search-result-item" onclick="startChatWith('${u.email}','${encodeURIComponent(u.name)}','${u.color}')">
-      <div class="avatar" style="background:${u.color};width:30px;height:30px;font-size:.75rem">${initials(u.name)}</div>
-      <div class="sr-info">
-        <div class="sr-name">${esc(u.name)}</div>
-        <div class="sr-email">${esc(u.email)}</div>
-      </div>
-    </div>`).join('');
-  el.classList.add('open');
-}
-function closeSearch() {
-  $('search-results').classList.remove('open');
-}
-function startChatWith(email, nameEnc, color) {
-  $('search-input').value = '';
-  closeSearch();
-  const name = decodeURIComponent(nameEnc);
-  // Add to threads if not present
-  if (!S.threads.find(t => t.contact === email)) {
-    S.threads.unshift({contact:email, name, color, last_at:'', total:0});
-    renderThreadList();
-  }
-  openThread(email, nameEnc, color);
-}
-
-// ════════════════════════════════════════════════════════════════
-//  Boot
+//  BOOT
 // ════════════════════════════════════════════════════════════════
 checkSession();
 </script>
