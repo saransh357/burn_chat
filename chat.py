@@ -1440,6 +1440,7 @@ async function sendMessage() {
   area.dataset.hash = '';
   await loadThread(S.activeContact.email, true);
   loadInbox();
+  }
 
 // ════════════════════════════════════════════════════════════════
 //  Burn
