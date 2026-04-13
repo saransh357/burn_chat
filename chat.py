@@ -20,8 +20,6 @@ from functools import wraps
 from flask import (Flask, request, jsonify, g, session,
                    render_template_string, redirect, abort)
 from flask_cors import CORS
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 # ── bcrypt ────────────────────────────────────────────────────────────────────
 try:
@@ -48,74 +46,90 @@ import sqlite3
 # ── Config ────────────────────────────────────────────────────────────────────
 CHAOSKEY_URL = os.getenv("CHAOSKEY_URL", "").rstrip("/")
 SECRET_KEY   = os.getenv("SECRET_KEY", secrets.token_hex(32))
-DB_PATH      = os.getenv("DB_PATH", "burnchat.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")   # Postgres (Neon / Render)
+DB_PATH      = os.getenv("DB_PATH", "burnchat.db")  # SQLite fallback
 PORT         = int(os.getenv("PORT", 5000))
+
+USE_POSTGRES = bool(DATABASE_URL)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("BurnChat")
 
 if not CHAOSKEY_URL:
-    log.warning("CHAOSKEY_URL not set — encryption will fail. Set it to your ChaosKey instance URL.")
+    log.warning("CHAOSKEY_URL not set — encryption will fail.")
+log.info(f"Database backend: {'postgresql' if USE_POSTGRES else 'sqlite'}")
 
 app = Flask("BurnChat")
 app.secret_key = SECRET_KEY
 CORS(app, supports_credentials=True)
 
+# ── Database abstraction ──────────────────────────────────────────────────────
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
 
-# ── Database ──────────────────────────────────────────────────────────────────
+    def _pg_url():
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        return url
 
+    def get_db():
+        if "db" not in g:
+            g.db = psycopg2.connect(_pg_url())
+            g.db.autocommit = False
+        return g.db
 
-# Update Config
-DATABASE_URL = os.getenv("DATABASE_URL")
-DB_TYPE = os.getenv("DB_TYPE", "sqlite") # Default to sqlite if not set
+    @app.teardown_appcontext
+    def close_db(exc):
+        db = g.pop("db", None)
+        if db:
+            db.rollback() if exc else db.commit()
+            db.close()
 
-def get_db():
-    if "db" not in g:
-        if DATABASE_URL and DB_TYPE == "postgres":
-            # Connect to PostgreSQL
-            g.db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        else:
-            # Fallback to SQLite
-            import sqlite3
+    def db_exec(sql, params=()):
+        sql = sql.replace("?", "%s")
+        cur = get_db().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def db_commit():
+        get_db().commit()
+
+else:
+    def get_db():
+        if "db" not in g:
             g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
             g.db.row_factory = sqlite3.Row
             g.db.execute("PRAGMA journal_mode=WAL")
-    return g.db
+            g.db.execute("PRAGMA foreign_keys=ON")
+        return g.db
 
-def db_exec(sql, params=()):
-    db = get_db()
-    # PostgreSQL uses %s placeholders, SQLite uses ?
-    if DB_TYPE == "postgres":
-        sql = sql.replace("?", "%s")
-    
-    cur = db.cursor()
-    cur.execute(sql, params)
-    return cur
+    @app.teardown_appcontext
+    def close_db(exc):
+        db = g.pop("db", None)
+        if db:
+            db.close()
 
-def db_commit():
-    get_db().commit()
+    def db_exec(sql, params=()):
+        return get_db().execute(sql, params)
 
-def init_db():
-    # Update the SCHEMA for PostgreSQL compatibility (e.g., SERIAL instead of AUTOINCREMENT)
-    PG_SCHEMA = SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-    
-    with app.app_context():
-        db = get_db()
-        cur = db.cursor()
-        if DB_TYPE == "postgres":
-            cur.execute(PG_SCHEMA)
-        else:
-            db.executescript(SCHEMA)
-        db.commit()
-    log.info("Database initialized.")
-SCHEMA = """
+    def db_commit():
+        get_db().commit()
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+_AI = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+_UNIQUE_IDX = "-- index exists" if USE_POSTGRES else \
+    "CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(sender, recipient);"
+
+SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    email           TEXT UNIQUE NOT NULL,
-    display_name    TEXT NOT NULL,
-    password_hash   TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    avatar_color    TEXT NOT NULL DEFAULT '#ff6b35',
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    email            TEXT UNIQUE NOT NULL,
+    display_name     TEXT NOT NULL,
+    password_hash    TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    avatar_color     TEXT NOT NULL DEFAULT '#ff6b35',
     chaoskey_api_key TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -128,25 +142,60 @@ CREATE TABLE IF NOT EXISTS messages (
     plaintext    TEXT,
     sent_at      TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_msg_thread
-    ON messages(sender, recipient);
+CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(sender, recipient);
 """
+
+SCHEMA_PG_STMTS = [
+    """CREATE TABLE IF NOT EXISTS users (
+        id               SERIAL PRIMARY KEY,
+        email            TEXT UNIQUE NOT NULL,
+        display_name     TEXT NOT NULL,
+        password_hash    TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        avatar_color     TEXT NOT NULL DEFAULT '#ff6b35',
+        chaoskey_api_key TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS messages (
+        id           SERIAL PRIMARY KEY,
+        sender       TEXT NOT NULL,
+        recipient    TEXT NOT NULL,
+        ciphertext   TEXT NOT NULL,
+        nonce        TEXT NOT NULL,
+        enc_key      TEXT NOT NULL,
+        plaintext    TEXT,
+        sent_at      TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(sender, recipient)",
+]
+
+PG_MIGRATIONS = [
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_color TEXT NOT NULL DEFAULT '#ff6b35'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS chaoskey_api_key TEXT",
+]
 
 def init_db():
     with app.app_context():
-        db = sqlite3.connect(DB_PATH)
-        db.executescript(SCHEMA)
-        for col, default in [
-            ("avatar_color",     "'#ff6b35'"),
-            ("chaoskey_api_key", "NULL"),
-        ]:
-            try:
-                db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
-                db.commit()
-            except Exception:
-                pass
-        db.commit()
-        db.close()
+        if USE_POSTGRES:
+            conn = psycopg2.connect(_pg_url())
+            conn.autocommit = True
+            cur = conn.cursor()
+            for stmt in SCHEMA_PG_STMTS + PG_MIGRATIONS:
+                try:
+                    cur.execute(stmt)
+                except Exception as e:
+                    log.warning(f"Migration skipped: {e}")
+            conn.close()
+        else:
+            db = sqlite3.connect(DB_PATH)
+            db.executescript(SCHEMA_SQLITE)
+            for col, default in [("avatar_color", "'#ff6b35'"), ("chaoskey_api_key", "NULL")]:
+                try:
+                    db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+                    db.commit()
+                except Exception:
+                    pass
+            db.commit()
+            db.close()
     log.info("Database ready.")
 
 
@@ -351,7 +400,9 @@ def send_message():
     # Encrypt via ChaosKey
     ok, enc = ck_encrypt(plaintext)
     if not ok:
-        return jsonify({"error": enc.get("error", "Encryption failed")}), 502
+        err_msg = enc.get("error", "Encryption failed")
+        log.warning(f"ck_encrypt failed for {sender}: {err_msg}")
+        return jsonify({"error": f"Encryption failed: {err_msg}"}), 502
 
     db_exec(
         "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at) "
@@ -466,11 +517,11 @@ def search_user():
 
 @app.route("/health")
 def health():
-    ck_ok = bool(CHAOSKEY_URL and CHAOSKEY_API_KEY)
     return jsonify({
-        "status":           "ok",
-        "chaoskey_url":     CHAOSKEY_URL or None,
-        "chaoskey_ready":   ck_ok,
+        "status":         "ok",
+        "chaoskey_url":   CHAOSKEY_URL or None,
+        "chaoskey_ready": bool(CHAOSKEY_URL),
+        "db_backend":     "postgresql" if USE_POSTGRES else "sqlite",
     })
 
 
@@ -1387,7 +1438,10 @@ async function sendMessage() {
   btn.disabled = false;
 
   if (!ok) {
-    toast('✗ ' + (data.error || 'Send failed'), 'err');
+    const msg = data.error || 'Send failed';
+    toast('✗ ' + msg, 'err', 5000);
+    inp.value = txt;  // restore text so user doesn't lose it
+    autoResize(inp);
     return;
   }
 
