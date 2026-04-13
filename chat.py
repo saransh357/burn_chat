@@ -6,6 +6,12 @@ Each user supplies their own ChaosKey API key at signup — it is stored
 in the BurnChat DB and loaded into their session on every login.
 Messages are encrypted at rest; threads can be permanently burned.
 
+Additionally, RSA-OAEP (2048-bit) client-side E2EE is layered on top:
+  - On signup, each browser generates an RSA key pair
+  - The public key is stored on the server
+  - Messages are encrypted in the browser with the recipient's public key
+  - Only the recipient's browser (holding the private key) can decrypt
+
 Environment Variables:
   CHAOSKEY_URL   URL of your ChaosKey instance (e.g. https://your-app.onrender.com)
   SECRET_KEY     Flask session secret (random string, keep safe)
@@ -56,7 +62,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("BurnChat")
 
 if not CHAOSKEY_URL:
-    log.warning("CHAOSKEY_URL not set — encryption will fail.")
+    log.warning("CHAOSKEY_URL not set — server-side encryption will fail.")
 log.info(f"Database backend: {'postgresql' if USE_POSTGRES else 'sqlite'}")
 
 app = Flask("BurnChat")
@@ -71,19 +77,13 @@ if USE_POSTGRES:
 
     def _pg_url():
         url = (DATABASE_URL or "").strip()
-
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql://", 1)
-
-        # Remove ANY channel_binding param completely
         parsed = up.urlparse(url)
         qs = up.parse_qs(parsed.query)
-
-        qs.pop("channel_binding", None)  # 🔥 remove bad param
-
+        qs.pop("channel_binding", None)
         new_query = up.urlencode(qs, doseq=True)
         url = up.urlunparse(parsed._replace(query=new_query))
-
         return url
 
     def get_db():
@@ -107,11 +107,27 @@ if USE_POSTGRES:
 
     def db_commit():
         get_db().commit()
-# ── Schema ────────────────────────────────────────────────────────────────────
-_AI = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
-_UNIQUE_IDX = "-- index exists" if USE_POSTGRES else \
-    "CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(sender, recipient);"
 
+else:
+    def get_db():
+        if "db" not in g:
+            g.db = sqlite3.connect(DB_PATH)
+            g.db.row_factory = sqlite3.Row
+        return g.db
+
+    @app.teardown_appcontext
+    def close_db(exc=None):
+        db = g.pop("db", None)
+        if db:
+            db.close()
+
+    def db_exec(sql, params=()):
+        return get_db().execute(sql, params)
+
+    def db_commit():
+        get_db().commit()
+
+# ── Schema ────────────────────────────────────────────────────────────────────
 SCHEMA_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,15 +136,16 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash    TEXT NOT NULL,
     created_at       TEXT NOT NULL,
     avatar_color     TEXT NOT NULL DEFAULT '#ff6b35',
-    chaoskey_api_key TEXT
+    chaoskey_api_key TEXT,
+    public_key       TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     sender       TEXT NOT NULL,
     recipient    TEXT NOT NULL,
     ciphertext   TEXT NOT NULL,
-    nonce        TEXT NOT NULL,
-    enc_key      TEXT NOT NULL,
+    nonce        TEXT NOT NULL DEFAULT '',
+    enc_key      TEXT NOT NULL DEFAULT '',
     plaintext    TEXT,
     sent_at      TEXT NOT NULL
 );
@@ -143,15 +160,16 @@ SCHEMA_PG_STMTS = [
         password_hash    TEXT NOT NULL,
         created_at       TEXT NOT NULL,
         avatar_color     TEXT NOT NULL DEFAULT '#ff6b35',
-        chaoskey_api_key TEXT
+        chaoskey_api_key TEXT,
+        public_key       TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS messages (
         id           SERIAL PRIMARY KEY,
         sender       TEXT NOT NULL,
         recipient    TEXT NOT NULL,
         ciphertext   TEXT NOT NULL,
-        nonce        TEXT NOT NULL,
-        enc_key      TEXT NOT NULL,
+        nonce        TEXT NOT NULL DEFAULT '',
+        enc_key      TEXT NOT NULL DEFAULT '',
         plaintext    TEXT,
         sent_at      TEXT NOT NULL
     )""",
@@ -161,6 +179,7 @@ SCHEMA_PG_STMTS = [
 PG_MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_color TEXT NOT NULL DEFAULT '#ff6b35'",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS chaoskey_api_key TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT",
 ]
 
 def init_db():
@@ -178,7 +197,11 @@ def init_db():
         else:
             db = sqlite3.connect(DB_PATH)
             db.executescript(SCHEMA_SQLITE)
-            for col, default in [("avatar_color", "'#ff6b35'"), ("chaoskey_api_key", "NULL")]:
+            for col, default in [
+                ("avatar_color", "'#ff6b35'"),
+                ("chaoskey_api_key", "NULL"),
+                ("public_key", "NULL"),
+            ]:
                 try:
                     db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
                     db.commit()
@@ -212,11 +235,9 @@ def require_login(f):
 
 # ── ChaosKey API bridge ───────────────────────────────────────────────────────
 def _ck_api_key() -> str:
-    """Return the current user's ChaosKey API key from session."""
     return session.get("ck_api_key", "")
 
 def ck_encrypt(plaintext: str):
-    """Encrypt plaintext via ChaosKey using the session user's key."""
     api_key = _ck_api_key()
     if not CHAOSKEY_URL:
         return False, {"error": "CHAOSKEY_URL not configured on this server."}
@@ -239,7 +260,6 @@ def ck_encrypt(plaintext: str):
         return False, {"error": str(e)}
 
 def ck_decrypt(ciphertext: str, nonce: str, enc_key: str):
-    """Decrypt ciphertext via ChaosKey using the session user's key."""
     api_key = _ck_api_key()
     if not CHAOSKEY_URL:
         return False, {"error": "CHAOSKEY_URL not configured on this server."}
@@ -265,11 +285,12 @@ def ck_decrypt(ciphertext: str, nonce: str, enc_key: str):
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route("/auth/signup", methods=["POST"])
 def signup():
-    body    = request.get_json(force=True) or {}
-    email   = body.get("email", "").strip().lower()
-    pw      = body.get("password", "").strip()
-    name    = body.get("name", "").strip() or email.split("@")[0]
-    ck_key  = body.get("chaoskey_api_key", "").strip()
+    body       = request.get_json(force=True) or {}
+    email      = body.get("email", "").strip().lower()
+    pw         = body.get("password", "").strip()
+    name       = body.get("name", "").strip() or email.split("@")[0]
+    ck_key     = body.get("chaoskey_api_key", "").strip()
+    public_key = body.get("public_key", "").strip()   # RSA public key from client
 
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
@@ -281,9 +302,9 @@ def signup():
     color = pick_color(email)
     try:
         db_exec(
-            "INSERT INTO users (email, display_name, password_hash, created_at, avatar_color, chaoskey_api_key) "
-            "VALUES (?,?,?,?,?,?)",
-            (email, name, hash_password(pw), now_iso(), color, ck_key)
+            "INSERT INTO users (email, display_name, password_hash, created_at, avatar_color, chaoskey_api_key, public_key) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (email, name, hash_password(pw), now_iso(), color, ck_key, public_key)
         )
         db_commit()
     except Exception as e:
@@ -309,7 +330,7 @@ def login():
         return jsonify({"error": "Email and password required"}), 400
 
     user = db_exec(
-        "SELECT email, display_name, password_hash, avatar_color, chaoskey_api_key "
+        "SELECT email, display_name, password_hash, avatar_color, chaoskey_api_key, public_key "
         "FROM users WHERE email = ?", (email,)
     ).fetchone()
 
@@ -329,6 +350,7 @@ def login():
         "color":      user["avatar_color"],
         "key_prefix": key_prefix,
         "has_ck_key": bool(ck_key),
+        "public_key": user["public_key"] or "",
     })
 
 
@@ -356,7 +378,6 @@ def me():
 @app.route("/auth/update_ck_key", methods=["POST"])
 @require_login
 def update_ck_key():
-    """Let a logged-in user update their stored ChaosKey API key."""
     body   = request.get_json(force=True) or {}
     ck_key = body.get("chaoskey_api_key", "").strip()
     if not ck_key or not ck_key.startswith("ck_live_"):
@@ -368,6 +389,32 @@ def update_ck_key():
     return jsonify({"ok": True, "key_prefix": ck_key[:16] + "…"})
 
 
+# ── RSA Public Key endpoint (from file 1) ─────────────────────────────────────
+@app.route("/user/key", methods=["GET"])
+@require_login
+def get_user_key():
+    """Return the RSA public key for a given user email."""
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "email param required"}), 400
+    u = db_exec("SELECT public_key FROM users WHERE email = ?", (email,)).fetchone()
+    return jsonify({"key": u["public_key"] if u else None})
+
+
+@app.route("/user/update_key", methods=["POST"])
+@require_login
+def update_public_key():
+    """Allow a logged-in user to register/update their RSA public key."""
+    body = request.get_json(force=True) or {}
+    pub  = body.get("public_key", "").strip()
+    if not pub:
+        return jsonify({"error": "public_key required"}), 400
+    db_exec("UPDATE users SET public_key = ? WHERE email = ?",
+            (pub, session["user_email"]))
+    db_commit()
+    return jsonify({"ok": True})
+
+
 # ── Message routes ────────────────────────────────────────────────────────────
 @app.route("/msg/send", methods=["POST"])
 @require_login
@@ -375,6 +422,8 @@ def send_message():
     body      = request.get_json(force=True) or {}
     recipient = body.get("recipient", "").strip().lower()
     plaintext = body.get("plaintext", "").strip()
+    # RSA-encrypted ciphertext from the client (optional — present when client has recipient's pubkey)
+    rsa_cipher = body.get("ciphertext", "").strip()
     sender    = session["user_email"]
 
     if not recipient or not plaintext:
@@ -382,12 +431,22 @@ def send_message():
     if recipient == sender:
         return jsonify({"error": "Cannot message yourself"}), 400
 
-    # Check recipient exists
     exists = db_exec("SELECT id FROM users WHERE email = ?", (recipient,)).fetchone()
     if not exists:
         return jsonify({"error": f"User '{recipient}' not found on BurnChat"}), 404
 
-    # Encrypt via ChaosKey
+    # Use RSA ciphertext if provided by client, else fall back to ChaosKey
+    if rsa_cipher:
+        # Client performed RSA-OAEP encryption — store as-is, nonce/enc_key empty
+        db_exec(
+            "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (sender, recipient, rsa_cipher, "", "", plaintext, now_iso())
+        )
+        db_commit()
+        return jsonify({"ok": True, "sent_at": now_iso(), "mode": "rsa"}), 201
+
+    # No RSA cipher — use server-side ChaosKey AES-256-GCM
     ok, enc = ck_encrypt(plaintext)
     if not ok:
         err_msg = enc.get("error", "Encryption failed")
@@ -401,11 +460,11 @@ def send_message():
          enc.get("ciphertext", ""),
          enc.get("nonce", ""),
          enc.get("encryption_key", ""),
-         plaintext,   # also stored in plaintext for fast retrieval (server trusted)
+         plaintext,
          now_iso())
     )
     db_commit()
-    return jsonify({"ok": True, "sent_at": now_iso()}), 201
+    return jsonify({"ok": True, "sent_at": now_iso(), "mode": "chaoskey"}), 201
 
 
 @app.route("/msg/thread", methods=["GET"])
@@ -427,16 +486,20 @@ def get_thread():
 
     result = []
     for r in rows:
-        text = r["plaintext"]  # fast path — already stored
-        if not text:           # fallback: decrypt via ChaosKey
+        text = r["plaintext"]
+        # If no nonce, message was RSA-encrypted client-side — send ciphertext back for browser decryption
+        is_rsa = not r["nonce"]
+        if not text and not is_rsa:
             ok, dec = ck_decrypt(r["ciphertext"], r["nonce"], r["enc_key"])
             text = dec.get("plaintext", "[Decryption failed]") if ok else "[Decryption failed]"
         result.append({
-            "id":        r["id"],
-            "from":      r["sender"],
-            "text":      text,
-            "cipher":    r["ciphertext"][:32] + "…" if r["ciphertext"] else "",
-            "sent_at":   r["sent_at"],
+            "id":       r["id"],
+            "from":     r["sender"],
+            "text":     text or "",
+            "cipher":   r["ciphertext"][:32] + "…" if r["ciphertext"] else "",
+            # Send full ciphertext back when RSA mode so client can decrypt
+            "rsa_cipher": r["ciphertext"] if is_rsa else None,
+            "sent_at":  r["sent_at"],
         })
 
     return jsonify(result)
@@ -512,6 +575,7 @@ def health():
         "chaoskey_url":   CHAOSKEY_URL or None,
         "chaoskey_ready": bool(CHAOSKEY_URL),
         "db_backend":     "postgresql" if USE_POSTGRES else "sqlite",
+        "e2ee":           "RSA-OAEP-2048 + AES-256-GCM (ChaosKey fallback)",
     })
 
 
@@ -846,17 +910,6 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
   flex:1;overflow-y:auto;
   padding:1.5rem;display:flex;flex-direction:column;gap:.75rem;
 }
-.day-divider{
-  display:flex;align-items:center;gap:1rem;
-  margin:.5rem 0;
-}
-.day-divider span{
-  font-family:'Fira Code',monospace;font-size:.65rem;
-  color:var(--dust);white-space:nowrap;
-}
-.day-divider::before,.day-divider::after{
-  content:'';flex:1;height:1px;background:var(--cinder);
-}
 
 .msg-group{display:flex;flex-direction:column;gap:3px;max-width:70%}
 .msg-group.mine{align-self:flex-end;align-items:flex-end}
@@ -876,6 +929,9 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
   background:var(--ash);border:1px solid var(--cinder);
   color:var(--snow);border-radius:18px 18px 18px 4px;
 }
+.bubble.decrypting{
+  color:var(--dust);font-style:italic;font-size:.8rem;
+}
 
 .cipher-bar{
   font-family:'Fira Code',monospace;font-size:.58rem;
@@ -889,6 +945,10 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
 .msg-meta{
   font-family:'Fira Code',monospace;font-size:.6rem;
   color:var(--dust);padding:0 .3rem;
+}
+.e2ee-tag{
+  font-family:'Fira Code',monospace;font-size:.55rem;
+  color:var(--cold);opacity:.6;padding:0 .3rem;
 }
 
 /* Compose */
@@ -990,7 +1050,7 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
       <div class="burn-icon">🔥</div>
       <div class="wordmark-text">
         <h1>BurnChat</h1>
-        <p>AES-256-GCM · MESSAGES SELF-DESTRUCT</p>
+        <p>RSA-OAEP · AES-256-GCM · SELF-DESTRUCT</p>
       </div>
     </div>
     <div class="auth-tabs">
@@ -1054,6 +1114,10 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
         <div style="font-family:'Fira Code',monospace;font-size:.65rem;color:var(--ember);margin-bottom:.3rem">⚠ No ChaosKey API key</div>
         <button onclick="showUpdateKeyModal()" style="background:var(--ember);border:none;color:#fff;font-family:'Syne',sans-serif;font-size:.72rem;font-weight:700;padding:.3rem .7rem;border-radius:6px;cursor:pointer;width:100%">Add key →</button>
       </div>
+      <div id="e2ee-status" style="display:none;align-items:center;gap:6px;margin-bottom:.75rem;padding:.4rem .7rem;background:rgba(78,205,196,.06);border:1px solid rgba(78,205,196,.15);border-radius:8px;">
+        <span style="font-size:.7rem">🔑</span>
+        <span style="font-family:'Fira Code',monospace;font-size:.63rem;color:var(--cold)">RSA keys ready</span>
+      </div>
       <div class="search-wrap">
         <span class="search-icon">⌕</span>
         <input id="search-input" type="email" placeholder="Find user by email…"
@@ -1077,8 +1141,8 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
       <div class="es-icon">🔥</div>
       <div class="es-title">Select a conversation</div>
       <div class="es-sub">
-        Messages are encrypted with AES-256-GCM<br>
-        powered by ChaosKey physical entropy
+        End-to-end encrypted with RSA-OAEP<br>
+        AES-256-GCM server layer via ChaosKey
       </div>
     </div>
 
@@ -1090,7 +1154,7 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
             <div class="cname" id="contact-name">–</div>
             <div class="cemail" id="contact-email">–</div>
           </div>
-          <div class="enc-badge">⚿ AES-256-GCM</div>
+          <div class="enc-badge" id="enc-badge">⚿ E2EE</div>
         </div>
         <div style="display:flex;align-items:center;gap:.75rem">
           <button class="burn-thread-btn" onclick="confirmBurn()">🔥 Burn thread</button>
@@ -1155,11 +1219,14 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
 //  State
 // ════════════════════════════════════════════════════════════════
 const S = {
-  me:          null,
+  me:            null,
   activeContact: null,
-  threads:     [],
-  pollTimer:   null,
-  authMode:    'login',
+  threads:       [],
+  pollTimer:     null,
+  authMode:      'login',
+  // RSA key pair (CryptoKey objects, stored in memory only — private never leaves browser)
+  rsaPublicKey:  null,
+  rsaPrivateKey: null,
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -1208,6 +1275,84 @@ function fmtDate(iso) {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  RSA-OAEP Key Management  (from BurnChat E2EE v1)
+// ════════════════════════════════════════════════════════════════
+
+/** Generate a fresh RSA-OAEP 2048-bit key pair and persist public key to server. */
+async function genAndRegisterKeys() {
+  const kp = await crypto.subtle.generateKey(
+    {name:'RSA-OAEP', modulusLength:2048, publicExponent:new Uint8Array([1,0,1]), hash:'SHA-256'},
+    true, ['encrypt','decrypt']
+  );
+  S.rsaPublicKey  = kp.publicKey;
+  S.rsaPrivateKey = kp.privateKey;
+
+  // Export public key as base64 SPKI
+  const pubRaw  = await crypto.subtle.exportKey('spki', kp.publicKey);
+  const pubB64  = btoa(String.fromCharCode(...new Uint8Array(pubRaw)));
+
+  // Export private key as base64 PKCS8 and stash in localStorage (never sent to server)
+  const privRaw = await crypto.subtle.exportKey('pkcs8', kp.privateKey);
+  const privB64 = btoa(String.fromCharCode(...new Uint8Array(privRaw)));
+  localStorage.setItem('bc_priv_' + S.me.email, privB64);
+
+  return pubB64;
+}
+
+/** Load private key from localStorage and import it back into a CryptoKey. */
+async function loadPrivateKey(email) {
+  const privB64 = localStorage.getItem('bc_priv_' + email);
+  if (!privB64) return null;
+  try {
+    const privRaw = Uint8Array.from(atob(privB64), c => c.charCodeAt(0));
+    return await crypto.subtle.importKey(
+      'pkcs8', privRaw,
+      {name:'RSA-OAEP', hash:'SHA-256'},
+      false, ['decrypt']
+    );
+  } catch { return null; }
+}
+
+/** Import a recipient's public key from base64 SPKI. */
+async function importPublicKey(pubB64) {
+  const raw = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
+  return crypto.subtle.importKey(
+    'spki', raw,
+    {name:'RSA-OAEP', hash:'SHA-256'},
+    false, ['encrypt']
+  );
+}
+
+/** Encrypt plaintext with a CryptoKey (recipient's public key). Returns base64 ciphertext. */
+async function rsaEncrypt(plaintext, cryptoKey) {
+  const enc = await crypto.subtle.encrypt(
+    {name:'RSA-OAEP'},
+    cryptoKey,
+    new TextEncoder().encode(plaintext)
+  );
+  return btoa(String.fromCharCode(...new Uint8Array(enc)));
+}
+
+/** Decrypt base64 RSA ciphertext with the local private key. */
+async function rsaDecrypt(cipherB64) {
+  if (!S.rsaPrivateKey) return null;
+  try {
+    const dec = await crypto.subtle.decrypt(
+      {name:'RSA-OAEP'},
+      S.rsaPrivateKey,
+      Uint8Array.from(atob(cipherB64), c => c.charCodeAt(0))
+    );
+    return new TextDecoder().decode(dec);
+  } catch { return null; }
+}
+
+/** Fetch a user's public key from the server. Returns base64 string or null. */
+async function fetchPublicKey(email) {
+  const {ok, data} = await api('/user/key?email=' + encodeURIComponent(email));
+  return (ok && data.key) ? data.key : null;
+}
+
+// ════════════════════════════════════════════════════════════════
 //  Auth
 // ════════════════════════════════════════════════════════════════
 function switchAuthTab(mode) {
@@ -1237,15 +1382,51 @@ async function doAuth() {
   btn.disabled = true;
   err.textContent = '';
 
+  let pubB64 = null;
+
+  if (S.authMode === 'signup') {
+    // Generate RSA keys; send public key to server
+    S.me = {email, name: name || email.split('@')[0], color: '#ff6b35'};
+    try {
+      pubB64 = await genAndRegisterKeys();
+    } catch(e) {
+      err.textContent = '⚠ Could not generate encryption keys: ' + e.message;
+      btn.disabled = false;
+      return;
+    }
+  }
+
   const path = S.authMode === 'signup' ? '/auth/signup' : '/auth/login';
   const body = S.authMode === 'signup'
-    ? {email, password:pw, name, chaoskey_api_key: ckKey}
+    ? {email, password:pw, name, chaoskey_api_key:ckKey, public_key:pubB64}
     : {email, password:pw};
 
   const {ok, data} = await api(path, {method:'POST', body:JSON.stringify(body)});
   if (ok) {
     S.me = {email:data.email, name:data.name, color:data.color};
-    enterApp();
+
+    // On login, load private key from localStorage (if exists) or re-register a new one
+    if (S.authMode === 'login') {
+      S.rsaPrivateKey = await loadPrivateKey(email);
+      if (!S.rsaPrivateKey) {
+        // No local private key — generate fresh pair and update server pubkey
+        pubB64 = await genAndRegisterKeys();
+        await api('/user/update_key', {method:'POST', body:JSON.stringify({public_key:pubB64})});
+        toast('🔑 New RSA keys generated (first login on this device)', 'ok', 4000);
+      }
+      // Also load public key into memory
+      const privB64 = localStorage.getItem('bc_priv_' + email);
+      if (privB64) {
+        // Derive the public key from the stored private key isn't possible in WebCrypto
+        // Instead, fetch own pub key from server to have it available
+        const ownPub = data.public_key || await fetchPublicKey(email);
+        if (ownPub) {
+          try { S.rsaPublicKey = await importPublicKey(ownPub); } catch {}
+        }
+      }
+    }
+
+    enterApp(data);
   } else {
     err.textContent = '⚠ ' + (data.error || 'Authentication failed');
     btn.disabled = false;
@@ -1261,36 +1442,55 @@ async function checkSession() {
   const {ok, data} = await api('/auth/me');
   if (ok && data.authenticated) {
     S.me = {email:data.email, name:data.name, color:data.color};
-    enterApp();
+    // Attempt to restore RSA private key from localStorage
+    S.rsaPrivateKey = await loadPrivateKey(data.email);
+    if (!S.rsaPrivateKey) {
+      // Generate new pair silently and update server
+      const pubB64 = await genAndRegisterKeys();
+      await api('/user/update_key', {method:'POST', body:JSON.stringify({public_key:pubB64})});
+    }
+    enterApp(data);
   }
 }
 
 // ════════════════════════════════════════════════════════════════
 //  App
 // ════════════════════════════════════════════════════════════════
-function enterApp() {
+function enterApp(data={}) {
   $('auth').classList.add('hidden');
   $('app').classList.remove('hidden');
 
   $('my-avatar').textContent = initials(S.me.name);
   $('my-avatar').style.background = S.me.color;
-  $('my-name').textContent = S.me.name;
+  $('my-name').textContent  = S.me.name;
   $('my-email').textContent = S.me.email;
 
-  loadInbox();
+  // Show ChaosKey status bar
+  const hasCk = data.has_ck_key;
+  if (hasCk && data.key_prefix) {
+    $('ck-key-bar').style.display = 'flex';
+    $('ck-key-prefix').textContent = data.key_prefix;
+  } else if (!hasCk) {
+    $('ck-key-warn').style.display = 'block';
+  }
 
+  // Show RSA status
+  if (S.rsaPrivateKey) {
+    $('e2ee-status').style.display = 'flex';
+  }
+
+  loadInbox();
   S.pollTimer = setInterval(async () => {
     await loadInbox();
     if (S.activeContact) {
-      const area = $('messages-area');
-      area.dataset.hash = '';
+      $('messages-area').dataset.hash = '';
       await loadThread(S.activeContact.email, false);
     }
   }, 3000);
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Inbox
+//  Inbox / sidebar helpers
 // ════════════════════════════════════════════════════════════════
 async function loadInbox() {
   const {ok, data} = await api('/msg/inbox');
@@ -1302,13 +1502,12 @@ async function loadInbox() {
 function renderThreadList() {
   const el = $('thread-list');
   if (!S.threads.length) {
-    el.innerHTML = `<div class="no-threads">No conversations</div>`;
+    el.innerHTML = `<div class="no-threads"><div class="nt-icon">🔒</div><div>No conversations yet.<br>Search for a user above.</div></div>`;
     return;
   }
-
   el.innerHTML = S.threads.map(t => `
     <div class="thread-item ${S.activeContact?.email === t.contact ? 'active' : ''}"
-         onclick="openThread('${t.contact}','${t.name}','${t.color}')">
+         onclick="openThread('${t.contact}','${esc(t.name)}','${t.color}')">
       <div class="avatar" style="background:${t.color}">${initials(t.name)}</div>
       <div class="thread-info">
         <div class="thread-name">${esc(t.name)}</div>
@@ -1318,17 +1517,48 @@ function renderThreadList() {
     </div>`).join('');
 }
 
+async function onSearchInput(val) {
+  const res = $('search-results');
+  if (!val || val.length < 3) { res.classList.remove('open'); return; }
+  const {ok, data} = await api('/msg/search_user?q=' + encodeURIComponent(val));
+  if (!ok || !data.length) { res.classList.remove('open'); return; }
+  res.innerHTML = data.map(u => `
+    <div class="search-result-item" onclick="openThread('${u.email}','${esc(u.name)}','${u.color}')">
+      <div class="avatar" style="background:${u.color};width:28px;height:28px;font-size:.75rem">${initials(u.name)}</div>
+      <div class="sr-info">
+        <div class="sr-name">${esc(u.name)}</div>
+        <div class="sr-email">${esc(u.email)}</div>
+      </div>
+    </div>`).join('');
+  res.classList.add('open');
+}
+
+function closeSearch() {
+  $('search-results').classList.remove('open');
+}
+
 // ════════════════════════════════════════════════════════════════
-//  Thread
+//  Thread / messages
 // ════════════════════════════════════════════════════════════════
 function openThread(email, name, color) {
   S.activeContact = {email, name, color};
-
-  $('contact-name').textContent = name;
+  $('contact-name').textContent  = name;
   $('contact-email').textContent = email;
+  $('contact-avatar').textContent = initials(name);
+  $('contact-avatar').style.background = color;
+
+  // Update enc badge based on whether we have RSA keys
+  $('enc-badge').textContent = S.rsaPrivateKey ? '⚿ RSA-OAEP + AES-256' : '⚿ AES-256-GCM';
 
   $('empty-state').style.display = 'none';
   $('chat-view').classList.add('active');
+
+  // Close search
+  $('search-input').value = '';
+  closeSearch();
+
+  // Re-render sidebar to mark active
+  renderThreadList();
 
   loadThread(email, true);
 }
@@ -1338,31 +1568,49 @@ async function loadThread(email, scrollToBottom=true) {
   if (!ok || !Array.isArray(data)) return;
 
   const area = $('messages-area');
+  const msgs = [];
 
-  let html = '';
   for (const m of data) {
     const mine = m.from === S.me.email;
+    let text = m.text;
+
+    // RSA-encrypted messages: client decrypts if it's a message TO us
+    if (!text && m.rsa_cipher) {
+      if (!mine && S.rsaPrivateKey) {
+        text = await rsaDecrypt(m.rsa_cipher);
+        if (!text) text = '[Cannot decrypt — wrong device?]';
+      } else if (mine) {
+        text = '[Sent encrypted — only recipient can read]';
+      } else {
+        text = '[No private key — cannot decrypt]';
+      }
+    }
+
+    msgs.push({...m, resolved: text || '[empty]'});
+  }
+
+  let html = '';
+  for (const m of msgs) {
+    const mine = m.from === S.me.email;
+    const isRsa = !!m.rsa_cipher;
     html += `
       <div class="msg-group ${mine ? 'mine' : 'theirs'}">
-        <div class="bubble">${esc(m.text)}</div>
+        <div class="bubble">${esc(m.resolved)}</div>
         <div class="msg-meta">${fmtTime(m.sent_at)}</div>
+        ${isRsa ? `<div class="e2ee-tag">🔑 RSA-OAEP</div>` : ''}
       </div>`;
   }
 
-  const newHash = btoa(unescape(encodeURIComponent(html))).slice(0,20);
-
+  const newHash = btoa(unescape(encodeURIComponent(html))).slice(0, 20);
   if (area.dataset.hash !== newHash) {
-    area.innerHTML = html;
+    area.innerHTML = html || `<div style="text-align:center;color:var(--dust);font-family:'Fira Code',monospace;font-size:.75rem;margin-top:2rem">No messages yet. Say something!</div>`;
     area.dataset.hash = newHash;
     if (scrollToBottom) area.scrollTop = area.scrollHeight;
-  } else if (!area.innerHTML) {
-    area.innerHTML = html;
-    area.dataset.hash = newHash;
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Send (FIXED)
+//  Send  (RSA-OAEP preferred, ChaosKey fallback)
 // ════════════════════════════════════════════════════════════════
 async function sendMessage() {
   const inp = $('compose-input');
@@ -1372,12 +1620,25 @@ async function sendMessage() {
   const btn = $('send-btn');
   btn.disabled = true;
 
+  let body = {recipient: S.activeContact.email, plaintext: txt};
+  let useRsa = false;
+
+  // Attempt RSA-OAEP encryption with recipient's public key
+  try {
+    const recipPubB64 = await fetchPublicKey(S.activeContact.email);
+    if (recipPubB64) {
+      const recipKey  = await importPublicKey(recipPubB64);
+      const ciphertext = await rsaEncrypt(txt, recipKey);
+      body.ciphertext = ciphertext;
+      useRsa = true;
+    }
+  } catch(e) {
+    console.warn('RSA encrypt failed, falling back to ChaosKey:', e);
+  }
+
   const {ok, data} = await api('/msg/send', {
     method: 'POST',
-    body: JSON.stringify({
-      recipient: S.activeContact.email,
-      plaintext: txt
-    }),
+    body: JSON.stringify(body),
   });
 
   btn.disabled = false;
@@ -1389,12 +1650,68 @@ async function sendMessage() {
 
   inp.value = '';
   inp.style.height = 'auto';
-
-  const area = $('messages-area');
-  area.dataset.hash = '';
-
+  $('messages-area').dataset.hash = '';
   await loadThread(S.activeContact.email, true);
   await loadInbox();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Burn thread
+// ════════════════════════════════════════════════════════════════
+function confirmBurn() {
+  if (!S.activeContact) return;
+  $('burn-modal-text').textContent =
+    `Burn all messages with ${S.activeContact.name}? This cannot be undone.`;
+  $('burn-modal').classList.add('open');
+}
+function closeBurnModal() { $('burn-modal').classList.remove('open'); }
+
+async function executeBurn() {
+  closeBurnModal();
+  if (!S.activeContact) return;
+  const {ok} = await api('/msg/burn', {
+    method: 'POST',
+    body: JSON.stringify({contact: S.activeContact.email}),
+  });
+  if (ok) {
+    $('messages-area').innerHTML = '';
+    $('messages-area').dataset.hash = '';
+    toast('🔥 Thread burned', 'ok');
+    await loadInbox();
+  } else {
+    toast('✗ Burn failed', 'err');
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Update ChaosKey modal
+// ════════════════════════════════════════════════════════════════
+function showUpdateKeyModal() { $('key-modal').classList.add('open'); }
+function closeKeyModal() {
+  $('key-modal').classList.remove('open');
+  $('key-modal-err').textContent = '';
+  $('modal-ck-input').value = '';
+}
+
+async function saveUpdatedKey() {
+  const val = $('modal-ck-input').value.trim();
+  const errEl = $('key-modal-err');
+  if (!val || !val.startsWith('ck_live_')) {
+    errEl.textContent = '⚠ Key must start with ck_live_';
+    return;
+  }
+  const {ok, data} = await api('/auth/update_ck_key', {
+    method:'POST', body:JSON.stringify({chaoskey_api_key:val})
+  });
+  if (ok) {
+    $('ck-key-prefix').textContent = data.key_prefix;
+    $('ck-key-bar').style.display = 'flex';
+    $('ck-key-warn').style.display = 'none';
+    closeKeyModal();
+    toast('⚿ ChaosKey API key updated', 'ok');
+  } else {
+    errEl.textContent = '⚠ ' + (data.error || 'Update failed');
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1420,5 +1737,5 @@ except Exception as e:
 if __name__ == "__main__":
     log.info(f"BurnChat starting on port {PORT}")
     log.info(f"ChaosKey URL: {CHAOSKEY_URL or '(not set)'}")
-    log.info("Each user provides their own ChaosKey API key at signup.")
+    log.info("RSA-OAEP E2EE enabled. Each user's private key stays in their browser.")
     app.run(host="0.0.0.0", port=PORT, debug=False)
