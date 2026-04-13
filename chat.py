@@ -20,6 +20,8 @@ from functools import wraps
 from flask import (Flask, request, jsonify, g, session,
                    render_template_string, redirect, abort)
 from flask_cors import CORS
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ── bcrypt ────────────────────────────────────────────────────────────────────
 try:
@@ -46,7 +48,6 @@ import sqlite3
 # ── Config ────────────────────────────────────────────────────────────────────
 CHAOSKEY_URL = os.getenv("CHAOSKEY_URL", "").rstrip("/")
 SECRET_KEY   = os.getenv("SECRET_KEY", secrets.token_hex(32))
-DB_PATH      = os.getenv("DB_PATH", "")
 PORT         = int(os.getenv("PORT", 5000))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -61,26 +62,51 @@ CORS(app, supports_credentials=True)
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
+
+
+# Update Config
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_TYPE = os.getenv("DB_TYPE", "sqlite") # Default to sqlite if not set
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
-        g.db.execute("PRAGMA foreign_keys=ON")
+        if DATABASE_URL and DB_TYPE == "postgres":
+            # Connect to PostgreSQL
+            g.db = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        else:
+            # Fallback to SQLite
+            import sqlite3
+            g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+            g.db.row_factory = sqlite3.Row
+            g.db.execute("PRAGMA journal_mode=WAL")
     return g.db
 
-@app.teardown_appcontext
-def close_db(exc):
-    db = g.pop("db", None)
-    if db:
-        db.close()
-
 def db_exec(sql, params=()):
-    return get_db().execute(sql, params)
+    db = get_db()
+    # PostgreSQL uses %s placeholders, SQLite uses ?
+    if DB_TYPE == "postgres":
+        sql = sql.replace("?", "%s")
+    
+    cur = db.cursor()
+    cur.execute(sql, params)
+    return cur
 
 def db_commit():
     get_db().commit()
 
+def init_db():
+    # Update the SCHEMA for PostgreSQL compatibility (e.g., SERIAL instead of AUTOINCREMENT)
+    PG_SCHEMA = SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    
+    with app.app_context():
+        db = get_db()
+        cur = db.cursor()
+        if DB_TYPE == "postgres":
+            cur.execute(PG_SCHEMA)
+        else:
+            db.executescript(SCHEMA)
+        db.commit()
+    log.info("Database initialized.")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
