@@ -2,14 +2,15 @@
 BurnChat — Encrypted Ephemeral Messenger
 =========================================
 Standalone product. Uses ChaosKey API for AES-256-GCM encryption.
+Each user supplies their own ChaosKey API key at signup — it is stored
+in the BurnChat DB and loaded into their session on every login.
 Messages are encrypted at rest; threads can be permanently burned.
 
 Environment Variables:
-  CHAOSKEY_URL      URL of your ChaosKey instance (e.g. https://your-app.onrender.com)
-  CHAOSKEY_API_KEY  A valid ChaosKey API key (ck_live_…) used server-side for crypto
-  SECRET_KEY        Flask session secret (random string, keep safe)
-  DB_PATH           SQLite database file path (default: burnchat.db)
-  PORT              Port to listen on (default: 5000)
+  CHAOSKEY_URL   URL of your ChaosKey instance (e.g. https://your-app.onrender.com)
+  SECRET_KEY     Flask session secret (random string, keep safe)
+  DB_PATH        SQLite database file path (default: burnchat.db)
+  PORT           Port to listen on (default: 5000)
 """
 
 import os, secrets, hashlib, hmac, time, logging, json, requests
@@ -43,19 +44,16 @@ except ImportError:
 import sqlite3
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHAOSKEY_URL     = os.getenv("CHAOSKEY_URL", "").rstrip("/")
-CHAOSKEY_API_KEY = os.getenv("CHAOSKEY_API_KEY", "")
-SECRET_KEY       = os.getenv("SECRET_KEY", secrets.token_hex(32))
-DB_PATH          = os.getenv("DB_PATH", "burnchat.db")
-PORT             = int(os.getenv("PORT", 5000))
+CHAOSKEY_URL = os.getenv("CHAOSKEY_URL", "").rstrip("/")
+SECRET_KEY   = os.getenv("SECRET_KEY", secrets.token_hex(32))
+DB_PATH      = os.getenv("DB_PATH", "burnchat.db")
+PORT         = int(os.getenv("PORT", 5000))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("BurnChat")
 
 if not CHAOSKEY_URL:
     log.warning("CHAOSKEY_URL not set — encryption will fail. Set it to your ChaosKey instance URL.")
-if not CHAOSKEY_API_KEY:
-    log.warning("CHAOSKEY_API_KEY not set — encryption will fail. Generate a key from ChaosKey.")
 
 app = Flask("BurnChat")
 app.secret_key = SECRET_KEY
@@ -85,12 +83,13 @@ def db_commit():
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    email        TEXT UNIQUE NOT NULL,
-    display_name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at   TEXT NOT NULL,
-    avatar_color TEXT NOT NULL DEFAULT '#ff6b35'
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    email           TEXT UNIQUE NOT NULL,
+    display_name    TEXT NOT NULL,
+    password_hash   TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    avatar_color    TEXT NOT NULL DEFAULT '#ff6b35',
+    chaoskey_api_key TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,11 +109,15 @@ def init_db():
     with app.app_context():
         db = sqlite3.connect(DB_PATH)
         db.executescript(SCHEMA)
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN avatar_color TEXT NOT NULL DEFAULT '#ff6b35'")
-            db.commit()
-        except Exception:
-            pass
+        for col, default in [
+            ("avatar_color",     "'#ff6b35'"),
+            ("chaoskey_api_key", "NULL"),
+        ]:
+            try:
+                db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+                db.commit()
+            except Exception:
+                pass
         db.commit()
         db.close()
     log.info("Database ready.")
@@ -142,14 +145,21 @@ def require_login(f):
 
 
 # ── ChaosKey API bridge ───────────────────────────────────────────────────────
+def _ck_api_key() -> str:
+    """Return the current user's ChaosKey API key from session."""
+    return session.get("ck_api_key", "")
+
 def ck_encrypt(plaintext: str):
-    """Encrypt plaintext via ChaosKey. Returns (ok, data)."""
-    if not CHAOSKEY_URL or not CHAOSKEY_API_KEY:
-        return False, {"error": "ChaosKey not configured. Set CHAOSKEY_URL and CHAOSKEY_API_KEY."}
+    """Encrypt plaintext via ChaosKey using the session user's key."""
+    api_key = _ck_api_key()
+    if not CHAOSKEY_URL:
+        return False, {"error": "CHAOSKEY_URL not configured on this server."}
+    if not api_key:
+        return False, {"error": "No ChaosKey API key in session. Please log out and log back in."}
     try:
         r = requests.post(
             f"{CHAOSKEY_URL}/v1/encrypt",
-            headers={"Authorization": f"Bearer {CHAOSKEY_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"plaintext": plaintext},
             timeout=15,
         )
@@ -163,13 +173,16 @@ def ck_encrypt(plaintext: str):
         return False, {"error": str(e)}
 
 def ck_decrypt(ciphertext: str, nonce: str, enc_key: str):
-    """Decrypt ciphertext via ChaosKey. Returns (ok, data)."""
-    if not CHAOSKEY_URL or not CHAOSKEY_API_KEY:
-        return False, {"error": "ChaosKey not configured."}
+    """Decrypt ciphertext via ChaosKey using the session user's key."""
+    api_key = _ck_api_key()
+    if not CHAOSKEY_URL:
+        return False, {"error": "CHAOSKEY_URL not configured on this server."}
+    if not api_key:
+        return False, {"error": "No ChaosKey API key in session."}
     try:
         r = requests.post(
             f"{CHAOSKEY_URL}/v1/decrypt",
-            headers={"Authorization": f"Bearer {CHAOSKEY_API_KEY}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"ciphertext": ciphertext, "nonce": nonce, "encryption_key": enc_key},
             timeout=15,
         )
@@ -186,21 +199,25 @@ def ck_decrypt(ciphertext: str, nonce: str, enc_key: str):
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route("/auth/signup", methods=["POST"])
 def signup():
-    body  = request.get_json(force=True) or {}
-    email = body.get("email", "").strip().lower()
-    pw    = body.get("password", "").strip()
-    name  = body.get("name", "").strip() or email.split("@")[0]
+    body    = request.get_json(force=True) or {}
+    email   = body.get("email", "").strip().lower()
+    pw      = body.get("password", "").strip()
+    name    = body.get("name", "").strip() or email.split("@")[0]
+    ck_key  = body.get("chaoskey_api_key", "").strip()
 
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
     if not pw or len(pw) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if not ck_key or not ck_key.startswith("ck_live_"):
+        return jsonify({"error": "Valid ChaosKey API key required (starts with ck_live_)"}), 400
 
     color = pick_color(email)
     try:
         db_exec(
-            "INSERT INTO users (email, display_name, password_hash, created_at, avatar_color) VALUES (?,?,?,?,?)",
-            (email, name, hash_password(pw), now_iso(), color)
+            "INSERT INTO users (email, display_name, password_hash, created_at, avatar_color, chaoskey_api_key) "
+            "VALUES (?,?,?,?,?,?)",
+            (email, name, hash_password(pw), now_iso(), color, ck_key)
         )
         db_commit()
     except Exception as e:
@@ -211,7 +228,9 @@ def signup():
     session["user_email"] = email
     session["user_name"]  = name
     session["user_color"] = color
-    return jsonify({"ok": True, "email": email, "name": name, "color": color}), 201
+    session["ck_api_key"] = ck_key
+    key_prefix = ck_key[:16] + "…"
+    return jsonify({"ok": True, "email": email, "name": name, "color": color, "key_prefix": key_prefix}), 201
 
 
 @app.route("/auth/login", methods=["POST"])
@@ -224,16 +243,27 @@ def login():
         return jsonify({"error": "Email and password required"}), 400
 
     user = db_exec(
-        "SELECT email, display_name, password_hash, avatar_color FROM users WHERE email = ?", (email,)
+        "SELECT email, display_name, password_hash, avatar_color, chaoskey_api_key "
+        "FROM users WHERE email = ?", (email,)
     ).fetchone()
 
     if not user or not check_password(pw, user["password_hash"]):
         return jsonify({"error": "Invalid email or password"}), 401
 
+    ck_key = user["chaoskey_api_key"] or ""
     session["user_email"] = user["email"]
     session["user_name"]  = user["display_name"]
     session["user_color"] = user["avatar_color"]
-    return jsonify({"ok": True, "email": user["email"], "name": user["display_name"], "color": user["avatar_color"]})
+    session["ck_api_key"] = ck_key
+    key_prefix = (ck_key[:16] + "…") if ck_key else None
+    return jsonify({
+        "ok":         True,
+        "email":      user["email"],
+        "name":       user["display_name"],
+        "color":      user["avatar_color"],
+        "key_prefix": key_prefix,
+        "has_ck_key": bool(ck_key),
+    })
 
 
 @app.route("/auth/logout", methods=["POST"])
@@ -246,12 +276,30 @@ def logout():
 def me():
     if "user_email" not in session:
         return jsonify({"authenticated": False}), 200
+    ck_key = session.get("ck_api_key", "")
     return jsonify({
         "authenticated": True,
-        "email": session["user_email"],
-        "name": session["user_name"],
-        "color": session.get("user_color", "#ff6b35"),
+        "email":      session["user_email"],
+        "name":       session["user_name"],
+        "color":      session.get("user_color", "#ff6b35"),
+        "has_ck_key": bool(ck_key),
+        "key_prefix": (ck_key[:16] + "…") if ck_key else None,
     })
+
+
+@app.route("/auth/update_ck_key", methods=["POST"])
+@require_login
+def update_ck_key():
+    """Let a logged-in user update their stored ChaosKey API key."""
+    body   = request.get_json(force=True) or {}
+    ck_key = body.get("chaoskey_api_key", "").strip()
+    if not ck_key or not ck_key.startswith("ck_live_"):
+        return jsonify({"error": "Valid ChaosKey API key required (starts with ck_live_)"}), 400
+    db_exec("UPDATE users SET chaoskey_api_key = ? WHERE email = ?",
+            (ck_key, session["user_email"]))
+    db_commit()
+    session["ck_api_key"] = ck_key
+    return jsonify({"ok": True, "key_prefix": ck_key[:16] + "…"})
 
 
 # ── Message routes ────────────────────────────────────────────────────────────
@@ -894,7 +942,16 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
       <div class="form-field">
         <label>Password</label>
         <input id="f-pw" type="password" placeholder="••••••••" autocomplete="current-password"
+          onkeydown="if(event.key==='Enter' && S.authMode==='login')doAuth(); else if(event.key==='Enter')document.getElementById('f-ck-key').focus()">
+      </div>
+      <div class="form-field" id="field-ck-key" style="display:none">
+        <label>ChaosKey API key</label>
+        <input id="f-ck-key" type="text" placeholder="ck_live_…" autocomplete="off" spellcheck="false"
+          style="font-family:'Fira Code',monospace;font-size:.82rem;letter-spacing:.01em"
           onkeydown="if(event.key==='Enter')doAuth()">
+        <div style="font-family:'Fira Code',monospace;font-size:.63rem;color:var(--fog);margin-top:.4rem;line-height:1.5">
+          Register on ChaosKey → copy your <code style="color:var(--ember)">ck_live_…</code> key here
+        </div>
       </div>
     </div>
     <button class="auth-submit" id="auth-btn" onclick="doAuth()">Sign in →</button>
@@ -917,6 +974,17 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
           </div>
         </div>
         <button class="logout-btn" onclick="doLogout()">exit</button>
+      </div>
+      <div id="ck-key-bar" style="display:none;align-items:center;justify-content:space-between;margin-bottom:.75rem;padding:.45rem .7rem;background:var(--ash);border:1px solid var(--smoke);border-radius:8px;">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span style="font-size:.7rem">⚿</span>
+          <span id="ck-key-prefix" style="font-family:'Fira Code',monospace;font-size:.65rem;color:var(--fog)"></span>
+        </div>
+        <button onclick="showUpdateKeyModal()" style="background:none;border:none;font-family:'Fira Code',monospace;font-size:.62rem;color:var(--dust);cursor:pointer;padding:0;transition:color .15s;" onmouseover="this.style.color='var(--ember)'" onmouseout="this.style.color='var(--dust)'">update</button>
+      </div>
+      <div id="ck-key-warn" style="display:none;padding:.5rem .7rem;background:rgba(255,107,53,.1);border:1px solid rgba(255,107,53,.25);border-radius:8px;margin-bottom:.75rem;">
+        <div style="font-family:'Fira Code',monospace;font-size:.65rem;color:var(--ember);margin-bottom:.3rem">⚠ No ChaosKey API key</div>
+        <button onclick="showUpdateKeyModal()" style="background:var(--ember);border:none;color:#fff;font-family:'Syne',sans-serif;font-size:.72rem;font-weight:700;padding:.3rem .7rem;border-radius:6px;cursor:pointer;width:100%">Add key →</button>
       </div>
       <div class="search-wrap">
         <span class="search-icon">⌕</span>
@@ -990,6 +1058,26 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
   </div>
 </div>
 
+<!-- Update ChaosKey API key modal -->
+<div class="modal-overlay" id="key-modal">
+  <div class="modal">
+    <div class="modal-icon">⚿</div>
+    <h2>Update ChaosKey API key</h2>
+    <p>Paste a fresh <code style="font-family:'Fira Code',monospace;color:var(--ember)">ck_live_…</code> key from your ChaosKey account. The old key will be replaced.</p>
+    <div style="margin:1rem 0">
+      <input id="modal-ck-input" type="text" placeholder="ck_live_…"
+        style="width:100%;padding:.75rem 1rem;background:var(--ash);border:1px solid var(--smoke);border-radius:8px;color:var(--snow);font-family:'Fira Code',monospace;font-size:.82rem;outline:none;"
+        onfocus="this.style.borderColor='var(--ember)'" onblur="this.style.borderColor='var(--smoke)'"
+        onkeydown="if(event.key==='Enter')saveUpdatedKey()">
+      <div id="key-modal-err" style="font-family:'Fira Code',monospace;font-size:.72rem;color:#ff8fab;min-height:1.1rem;margin-top:.4rem"></div>
+    </div>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeKeyModal()">Cancel</button>
+      <button class="modal-confirm" style="background:linear-gradient(135deg,var(--ember),var(--flame));box-shadow:0 4px 15px rgba(255,107,53,.3)" onclick="saveUpdatedKey()">Save key</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1056,30 +1144,36 @@ function switchAuthTab(mode) {
   S.authMode = mode;
   $('tab-in').classList.toggle('active', mode==='login');
   $('tab-up').classList.toggle('active', mode==='signup');
-  $('field-name').style.display = mode==='signup' ? 'block' : 'none';
+  $('field-name').style.display   = mode==='signup' ? 'block' : 'none';
+  $('field-ck-key').style.display = mode==='signup' ? 'block' : 'none';
   $('auth-btn').textContent = mode==='login' ? 'Sign in →' : 'Create account →';
   $('auth-err').textContent = '';
 }
 
 async function doAuth() {
-  const email = $('f-email').value.trim().toLowerCase();
-  const pw    = $('f-pw').value;
-  const name  = $('f-name').value.trim();
-  const err   = $('auth-err');
-  const btn   = $('auth-btn');
+  const email  = $('f-email').value.trim().toLowerCase();
+  const pw     = $('f-pw').value;
+  const name   = $('f-name').value.trim();
+  const ckKey  = $('f-ck-key').value.trim();
+  const err    = $('auth-err');
+  const btn    = $('auth-btn');
   if (!email) { err.textContent = '⚠ Email required'; return; }
   if (!pw)    { err.textContent = '⚠ Password required'; return; }
+  if (S.authMode === 'signup' && !ckKey) {
+    err.textContent = '⚠ ChaosKey API key required'; return;
+  }
   btn.disabled = true;
   err.textContent = '';
 
   const path = S.authMode === 'signup' ? '/auth/signup' : '/auth/login';
   const body = S.authMode === 'signup'
-    ? {email, password:pw, name}
+    ? {email, password:pw, name, chaoskey_api_key: ckKey}
     : {email, password:pw};
 
   const {ok, data} = await api(path, {method:'POST', body:JSON.stringify(body)});
   if (ok) {
-    S.me = {email:data.email, name:data.name, color:data.color};
+    S.me = {email:data.email, name:data.name, color:data.color,
+            hasKey:data.has_ck_key ?? true, keyPrefix:data.key_prefix};
     enterApp();
   } else {
     err.textContent = '⚠ ' + (data.error || 'Authentication failed');
@@ -1101,21 +1195,63 @@ async function doLogout() {
 async function checkSession() {
   const {ok, data} = await api('/auth/me');
   if (ok && data.authenticated) {
-    S.me = {email:data.email, name:data.name, color:data.color};
+    S.me = {email:data.email, name:data.name, color:data.color,
+            hasKey:data.has_ck_key, keyPrefix:data.key_prefix};
     enterApp();
+  }
+}
+
+// ── Update ChaosKey key modal ─────────────────────────────────────────────
+function showUpdateKeyModal() {
+  $('modal-ck-input').value = '';
+  $('key-modal-err').textContent = '';
+  $('key-modal').classList.add('open');
+  setTimeout(() => $('modal-ck-input').focus(), 100);
+}
+function closeKeyModal() {
+  $('key-modal').classList.remove('open');
+}
+async function saveUpdatedKey() {
+  const key = $('modal-ck-input').value.trim();
+  const errEl = $('key-modal-err');
+  if (!key || !key.startsWith('ck_live_')) {
+    errEl.textContent = '⚠ Must start with ck_live_'; return;
+  }
+  const {ok, data} = await api('/auth/update_ck_key', {
+    method: 'POST',
+    body: JSON.stringify({chaoskey_api_key: key}),
+  });
+  if (ok) {
+    S.me.hasKey = true; S.me.keyPrefix = data.key_prefix;
+    $('ck-key-prefix').textContent = data.key_prefix;
+    $('ck-key-bar').style.display  = 'flex';
+    $('ck-key-warn').style.display = 'none';
+    closeKeyModal();
+    toast('⚿ ChaosKey key updated', 'ok');
+  } else {
+    errEl.textContent = '⚠ ' + (data.error || 'Failed');
   }
 }
 
 function enterApp() {
   $('auth').classList.add('hidden');
   $('app').classList.remove('hidden');
-  // Fill user info
   const av = $('my-avatar');
   av.textContent = initials(S.me.name);
   av.style.background = S.me.color;
-  $('my-name').textContent = S.me.name;
+  $('my-name').textContent  = S.me.name;
   $('my-email').textContent = S.me.email;
-  // Load inbox
+
+  // Show ChaosKey key status in sidebar
+  if (S.me.hasKey && S.me.keyPrefix) {
+    $('ck-key-bar').style.display  = 'flex';
+    $('ck-key-warn').style.display = 'none';
+    $('ck-key-prefix').textContent = S.me.keyPrefix;
+  } else {
+    $('ck-key-bar').style.display  = 'none';
+    $('ck-key-warn').style.display = 'block';
+  }
+
   loadInbox();
   S.pollTimer = setInterval(() => {
     loadInbox();
@@ -1319,5 +1455,5 @@ init_db()
 if __name__ == "__main__":
     log.info(f"BurnChat starting on port {PORT}")
     log.info(f"ChaosKey URL: {CHAOSKEY_URL or '(not set)'}")
-    log.info(f"ChaosKey key: {'(set)' if CHAOSKEY_API_KEY else '(not set)'}")
+    log.info("Each user provides their own ChaosKey API key at signup.")
     app.run(host="0.0.0.0", port=PORT, debug=False)
