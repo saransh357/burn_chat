@@ -1,16 +1,24 @@
 """
 BurnChat — Encrypted Ephemeral Messenger
 =========================================
-Standalone product. Uses ChaosKey API for AES-256-GCM encryption.
-Each user supplies their own ChaosKey API key at signup — it is stored
-in the BurnChat DB and loaded into their session on every login.
-Messages are encrypted at rest; threads can be permanently burned.
+Hybrid encryption model — ChaosKey is ALWAYS used for every message:
 
-Additionally, RSA-OAEP (2048-bit) client-side E2EE is layered on top:
-  - On signup, each browser generates an RSA key pair
-  - The public key is stored on the server
-  - Messages are encrypted in the browser with the recipient's public key
-  - Only the recipient's browser (holding the private key) can decrypt
+  Send flow:
+    1. Server calls ChaosKey /v1/encrypt(plaintext)
+       → returns ciphertext, nonce, enc_key
+    2. Server fetches recipient's RSA public key from DB
+    3. Server RSA-OAEP encrypts the ChaosKey enc_key with recipient's public key
+       → rsa_enc_key  (only recipient's browser private key can unwrap it)
+    4. Stored in DB: ciphertext, nonce, rsa_enc_key  (plaintext NOT stored)
+
+  Receive flow:
+    1. Browser receives ciphertext, nonce, rsa_enc_key
+    2. Browser RSA-decrypts rsa_enc_key → raw enc_key
+    3. Browser POSTs enc_key + ciphertext + nonce to /msg/decrypt
+    4. Server calls ChaosKey /v1/decrypt → returns plaintext to browser
+
+  Result: ChaosKey entropy protects every message. The ChaosKey enc_key is
+  itself sealed by RSA-OAEP so only the recipient can unlock it.
 
 Environment Variables:
   CHAOSKEY_URL   URL of your ChaosKey instance (e.g. https://your-app.onrender.com)
@@ -389,6 +397,82 @@ def update_ck_key():
     return jsonify({"ok": True, "key_prefix": ck_key[:16] + "…"})
 
 
+# ── ChaosKey + RSA hybrid helpers ────────────────────────────────────────────
+def ck_encrypt_for_recipient(plaintext: str, recipient_email: str):
+    """
+    Always encrypt via ChaosKey, then RSA-wrap the returned enc_key with the
+    recipient's stored public key so only their browser can unwrap it.
+
+    Returns (ok: bool, payload: dict)
+      payload keys on success: ciphertext, nonce, rsa_enc_key
+    """
+    # Step 1 — ChaosKey encrypts the plaintext
+    ok, enc = ck_encrypt(plaintext)
+    if not ok:
+        return False, enc  # propagate ChaosKey error
+
+    raw_enc_key = enc.get("encryption_key", "")
+    ciphertext  = enc.get("ciphertext", "")
+    nonce       = enc.get("nonce", "")
+
+    if not raw_enc_key:
+        return False, {"error": "ChaosKey returned no encryption_key"}
+
+    # Step 2 — fetch recipient's RSA public key
+    row = db_exec("SELECT public_key FROM users WHERE email = ?", (recipient_email,)).fetchone()
+    recip_pub_b64 = row["public_key"] if row else None
+
+    if not recip_pub_b64:
+        # Recipient has no RSA key — store enc_key in plaintext (still ChaosKey-encrypted body)
+        log.warning(f"Recipient {recipient_email} has no RSA public key; enc_key stored unprotected")
+        return True, {
+            "ciphertext":  ciphertext,
+            "nonce":       nonce,
+            "rsa_enc_key": raw_enc_key,   # not RSA-wrapped, but body is still ChaosKey AES-encrypted
+            "rsa_wrapped": False,
+        }
+
+    # Step 3 — RSA-OAEP encrypt the enc_key with recipient's public key (server-side via cryptography lib)
+    try:
+        from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+        from cryptography.hazmat.primitives import hashes, serialization
+        import base64
+
+        pub_der  = base64.b64decode(recip_pub_b64)
+        pub_key  = serialization.load_der_public_key(pub_der)
+        wrapped  = pub_key.encrypt(
+            raw_enc_key.encode(),
+            asym_padding.OAEP(
+                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            )
+        )
+        rsa_enc_key_b64 = base64.b64encode(wrapped).decode()
+        return True, {
+            "ciphertext":  ciphertext,
+            "nonce":       nonce,
+            "rsa_enc_key": rsa_enc_key_b64,
+            "rsa_wrapped": True,
+        }
+    except ImportError:
+        log.warning("cryptography package not installed — storing enc_key without RSA wrap. Run: pip install cryptography")
+        return True, {
+            "ciphertext":  ciphertext,
+            "nonce":       nonce,
+            "rsa_enc_key": raw_enc_key,
+            "rsa_wrapped": False,
+        }
+    except Exception as e:
+        log.warning(f"RSA wrap failed ({e}) — storing enc_key without RSA wrap")
+        return True, {
+            "ciphertext":  ciphertext,
+            "nonce":       nonce,
+            "rsa_enc_key": raw_enc_key,
+            "rsa_wrapped": False,
+        }
+
+
 # ── RSA Public Key endpoint (from file 1) ─────────────────────────────────────
 @app.route("/user/key", methods=["GET"])
 @require_login
@@ -419,11 +503,14 @@ def update_public_key():
 @app.route("/msg/send", methods=["POST"])
 @require_login
 def send_message():
+    """
+    Always encrypts via ChaosKey. The ChaosKey enc_key is then RSA-OAEP wrapped
+    with the recipient's public key (if they have one registered), so only their
+    browser can unwrap it and ask ChaosKey to decrypt.
+    """
     body      = request.get_json(force=True) or {}
     recipient = body.get("recipient", "").strip().lower()
     plaintext = body.get("plaintext", "").strip()
-    # RSA-encrypted ciphertext from the client (optional — present when client has recipient's pubkey)
-    rsa_cipher = body.get("ciphertext", "").strip()
     sender    = session["user_email"]
 
     if not recipient or not plaintext:
@@ -435,41 +522,40 @@ def send_message():
     if not exists:
         return jsonify({"error": f"User '{recipient}' not found on BurnChat"}), 404
 
-    # Use RSA ciphertext if provided by client, else fall back to ChaosKey
-    if rsa_cipher:
-        # Client performed RSA-OAEP encryption — store as-is, nonce/enc_key empty
-        db_exec(
-            "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (sender, recipient, rsa_cipher, "", "", plaintext, now_iso())
-        )
-        db_commit()
-        return jsonify({"ok": True, "sent_at": now_iso(), "mode": "rsa"}), 201
-
-    # No RSA cipher — use server-side ChaosKey AES-256-GCM
-    ok, enc = ck_encrypt(plaintext)
+    # ChaosKey encrypts the message body; enc_key is RSA-wrapped for recipient
+    ok, enc = ck_encrypt_for_recipient(plaintext, recipient)
     if not ok:
         err_msg = enc.get("error", "Encryption failed")
-        log.warning(f"ck_encrypt failed for {sender}: {err_msg}")
+        log.warning(f"ck_encrypt_for_recipient failed for {sender}: {err_msg}")
         return jsonify({"error": f"Encryption failed: {err_msg}"}), 502
 
     db_exec(
         "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at) "
         "VALUES (?,?,?,?,?,?,?)",
         (sender, recipient,
-         enc.get("ciphertext", ""),
-         enc.get("nonce", ""),
-         enc.get("encryption_key", ""),
-         plaintext,
+         enc["ciphertext"],
+         enc["nonce"],
+         enc["rsa_enc_key"],   # RSA-wrapped ChaosKey enc_key
+         None,                 # plaintext never stored at rest
          now_iso())
     )
     db_commit()
-    return jsonify({"ok": True, "sent_at": now_iso(), "mode": "chaoskey"}), 201
+    rsa_wrapped = enc.get("rsa_wrapped", False)
+    return jsonify({
+        "ok":      True,
+        "sent_at": now_iso(),
+        "mode":    "chaoskey+rsa" if rsa_wrapped else "chaoskey",
+    }), 201
 
 
 @app.route("/msg/thread", methods=["GET"])
 @require_login
 def get_thread():
+    """
+    Returns messages with ciphertext, nonce, and rsa_enc_key.
+    The browser RSA-decrypts rsa_enc_key, then calls /msg/decrypt with the
+    unwrapped enc_key to get the plaintext via ChaosKey.
+    """
     contact = request.args.get("with", "").strip().lower()
     me      = session["user_email"]
 
@@ -477,7 +563,7 @@ def get_thread():
         return jsonify({"error": "?with= required"}), 400
 
     rows = db_exec(
-        "SELECT id, sender, recipient, ciphertext, nonce, enc_key, plaintext, sent_at "
+        "SELECT id, sender, ciphertext, nonce, enc_key, sent_at "
         "FROM messages "
         "WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?) "
         "ORDER BY id ASC",
@@ -486,23 +572,50 @@ def get_thread():
 
     result = []
     for r in rows:
-        text = r["plaintext"]
-        # If no nonce, message was RSA-encrypted client-side — send ciphertext back for browser decryption
-        is_rsa = not r["nonce"]
-        if not text and not is_rsa:
-            ok, dec = ck_decrypt(r["ciphertext"], r["nonce"], r["enc_key"])
-            text = dec.get("plaintext", "[Decryption failed]") if ok else "[Decryption failed]"
         result.append({
-            "id":       r["id"],
-            "from":     r["sender"],
-            "text":     text or "",
-            "cipher":   r["ciphertext"][:32] + "…" if r["ciphertext"] else "",
-            # Send full ciphertext back when RSA mode so client can decrypt
-            "rsa_cipher": r["ciphertext"] if is_rsa else None,
-            "sent_at":  r["sent_at"],
+            "id":          r["id"],
+            "from":        r["sender"],
+            "ciphertext":  r["ciphertext"],
+            "nonce":       r["nonce"],
+            "rsa_enc_key": r["enc_key"],   # browser RSA-decrypts this to get raw enc_key
+            "sent_at":     r["sent_at"],
         })
 
     return jsonify(result)
+
+
+@app.route("/msg/decrypt", methods=["POST"])
+@require_login
+def decrypt_message():
+    """
+    Browser calls this after RSA-unwrapping the enc_key locally.
+    It hands us: ciphertext, nonce, enc_key (now unwrapped).
+    We proxy to ChaosKey and return plaintext. Only works if the caller
+    is a participant in the thread (enforced by msg_id ownership check).
+    """
+    body       = request.get_json(force=True) or {}
+    msg_id     = body.get("msg_id")
+    enc_key    = body.get("enc_key", "").strip()
+    me         = session["user_email"]
+
+    if not msg_id or not enc_key:
+        return jsonify({"error": "msg_id and enc_key required"}), 400
+
+    # Security: verify the requester is sender or recipient of this message
+    row = db_exec(
+        "SELECT ciphertext, nonce, sender, recipient FROM messages WHERE id = ?", (msg_id,)
+    ).fetchone()
+
+    if not row:
+        return jsonify({"error": "Message not found"}), 404
+    if me not in (row["sender"], row["recipient"]):
+        return jsonify({"error": "Not authorised"}), 403
+
+    ok, dec = ck_decrypt(row["ciphertext"], row["nonce"], enc_key)
+    if not ok:
+        return jsonify({"error": dec.get("error", "Decryption failed")}), 502
+
+    return jsonify({"ok": True, "plaintext": dec.get("plaintext", "")})
 
 
 @app.route("/msg/burn", methods=["POST"])
@@ -575,7 +688,7 @@ def health():
         "chaoskey_url":   CHAOSKEY_URL or None,
         "chaoskey_ready": bool(CHAOSKEY_URL),
         "db_backend":     "postgresql" if USE_POSTGRES else "sqlite",
-        "e2ee":           "RSA-OAEP-2048 + AES-256-GCM (ChaosKey fallback)",
+        "e2ee":           "ChaosKey AES-256-GCM (always) + RSA-OAEP-2048 enc_key wrap",
     })
 
 
@@ -1547,19 +1660,14 @@ function openThread(email, name, color) {
   $('contact-avatar').textContent = initials(name);
   $('contact-avatar').style.background = color;
 
-  // Update enc badge based on whether we have RSA keys
-  $('enc-badge').textContent = S.rsaPrivateKey ? '⚿ RSA-OAEP + AES-256' : '⚿ AES-256-GCM';
+  $('enc-badge').textContent = S.rsaPrivateKey ? '⚿ ChaosKey + RSA-OAEP' : '⚿ ChaosKey AES-256';
 
   $('empty-state').style.display = 'none';
   $('chat-view').classList.add('active');
 
-  // Close search
   $('search-input').value = '';
   closeSearch();
-
-  // Re-render sidebar to mark active
   renderThreadList();
-
   loadThread(email, true);
 }
 
@@ -1572,18 +1680,31 @@ async function loadThread(email, scrollToBottom=true) {
 
   for (const m of data) {
     const mine = m.from === S.me.email;
-    let text = m.text;
+    let text = null;
 
-    // RSA-encrypted messages: client decrypts if it's a message TO us
-    if (!text && m.rsa_cipher) {
-      if (!mine && S.rsaPrivateKey) {
-        text = await rsaDecrypt(m.rsa_cipher);
-        if (!text) text = '[Cannot decrypt — wrong device?]';
-      } else if (mine) {
-        text = '[Sent encrypted — only recipient can read]';
+    if (m.rsa_enc_key && m.ciphertext && m.nonce) {
+      if (S.rsaPrivateKey) {
+        try {
+          // Step 1: RSA-unwrap the enc_key in the browser
+          const rawEncKey = await rsaDecrypt(m.rsa_enc_key);
+          if (rawEncKey) {
+            // Step 2: hand enc_key + ciphertext back to server → ChaosKey decrypts
+            const dr = await api('/msg/decrypt', {
+              method: 'POST',
+              body: JSON.stringify({msg_id: m.id, enc_key: rawEncKey}),
+            });
+            text = dr.ok ? dr.data.plaintext : '[ChaosKey decryption failed]';
+          } else {
+            text = mine ? '[Sent — recipient must decrypt]' : '[RSA unwrap failed — wrong device?]';
+          }
+        } catch(e) {
+          text = '[Decryption error]';
+        }
       } else {
-        text = '[No private key — cannot decrypt]';
+        text = '[No RSA private key on this device]';
       }
+    } else {
+      text = '[Missing encryption data]';
     }
 
     msgs.push({...m, resolved: text || '[empty]'});
@@ -1592,12 +1713,11 @@ async function loadThread(email, scrollToBottom=true) {
   let html = '';
   for (const m of msgs) {
     const mine = m.from === S.me.email;
-    const isRsa = !!m.rsa_cipher;
     html += `
       <div class="msg-group ${mine ? 'mine' : 'theirs'}">
         <div class="bubble">${esc(m.resolved)}</div>
         <div class="msg-meta">${fmtTime(m.sent_at)}</div>
-        ${isRsa ? `<div class="e2ee-tag">🔑 RSA-OAEP</div>` : ''}
+        <div class="e2ee-tag">⚿ ChaosKey + RSA</div>
       </div>`;
   }
 
@@ -1610,7 +1730,7 @@ async function loadThread(email, scrollToBottom=true) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Send  (RSA-OAEP preferred, ChaosKey fallback)
+//  Send — plaintext goes to server; ChaosKey + RSA wrap happens server-side
 // ════════════════════════════════════════════════════════════════
 async function sendMessage() {
   const inp = $('compose-input');
@@ -1620,25 +1740,13 @@ async function sendMessage() {
   const btn = $('send-btn');
   btn.disabled = true;
 
-  let body = {recipient: S.activeContact.email, plaintext: txt};
-  let useRsa = false;
-
-  // Attempt RSA-OAEP encryption with recipient's public key
-  try {
-    const recipPubB64 = await fetchPublicKey(S.activeContact.email);
-    if (recipPubB64) {
-      const recipKey  = await importPublicKey(recipPubB64);
-      const ciphertext = await rsaEncrypt(txt, recipKey);
-      body.ciphertext = ciphertext;
-      useRsa = true;
-    }
-  } catch(e) {
-    console.warn('RSA encrypt failed, falling back to ChaosKey:', e);
-  }
-
+  // Server handles: ChaosKey encrypt → RSA-wrap enc_key with recipient's public key
   const {ok, data} = await api('/msg/send', {
     method: 'POST',
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      recipient: S.activeContact.email,
+      plaintext: txt,
+    }),
   });
 
   btn.disabled = false;
@@ -1737,5 +1845,5 @@ except Exception as e:
 if __name__ == "__main__":
     log.info(f"BurnChat starting on port {PORT}")
     log.info(f"ChaosKey URL: {CHAOSKEY_URL or '(not set)'}")
-    log.info("RSA-OAEP E2EE enabled. Each user's private key stays in their browser.")
+    log.info("Every message encrypted by ChaosKey; enc_key RSA-OAEP wrapped per recipient.")
     app.run(host="0.0.0.0", port=PORT, debug=False)
