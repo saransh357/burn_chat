@@ -1155,15 +1155,15 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
 //  State
 // ════════════════════════════════════════════════════════════════
 const S = {
-  me: null,
+  me:          null,
   activeContact: null,
-  threads: [],
-  pollTimer: null,
-  authMode: 'login',
+  threads:     [],
+  pollTimer:   null,
+  authMode:    'login',
 };
 
 // ════════════════════════════════════════════════════════════════
-//  Utils
+//  Utilities
 // ════════════════════════════════════════════════════════════════
 const $  = id => document.getElementById(id);
 const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1184,7 +1184,7 @@ async function api(path, opts={}) {
   });
   const ct = r.headers.get('Content-Type') || '';
   const data = ct.includes('json') ? await r.json() : {error: 'Server error'};
-  return {ok: r.ok, data};
+  return {ok: r.ok, status: r.status, data};
 }
 
 function autoResize(ta) {
@@ -1193,20 +1193,22 @@ function autoResize(ta) {
 }
 
 function fmtTime(iso) {
+  if (!iso) return '';
   const d = new Date(iso);
   return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
 function fmtDate(iso) {
+  if (!iso) return '';
   const d = new Date(iso);
   const now = new Date();
   if (d.toDateString() === now.toDateString()) return 'Today';
-  const y = new Date(now); y.setDate(now.getDate()-1);
-  if (d.toDateString() === y.toDateString()) return 'Yesterday';
+  const yesterday = new Date(now); yesterday.setDate(now.getDate()-1);
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
   return d.toLocaleDateString([], {month:'short', day:'numeric'});
 }
 
 // ════════════════════════════════════════════════════════════════
-//  AUTH
+//  Auth
 // ════════════════════════════════════════════════════════════════
 function switchAuthTab(mode) {
   S.authMode = mode;
@@ -1224,39 +1226,54 @@ async function doAuth() {
   const name   = $('f-name').value.trim();
   const ckKey  = $('f-ck-key').value.trim();
   const err    = $('auth-err');
+  const btn    = $('auth-btn');
 
-  if (!email) return err.textContent = '⚠ Email required';
-  if (!pw) return err.textContent = '⚠ Password required';
-  if (S.authMode==='signup' && !ckKey)
-    return err.textContent = '⚠ ChaosKey API key required';
+  if (!email) { err.textContent = '⚠ Email required'; return; }
+  if (!pw)    { err.textContent = '⚠ Password required'; return; }
+  if (S.authMode === 'signup' && !ckKey) {
+    err.textContent = '⚠ ChaosKey API key required'; return;
+  }
 
-  const path = S.authMode==='signup'?'/auth/signup':'/auth/login';
-  const body = S.authMode==='signup'
-    ? {email, password:pw, name, chaoskey_api_key:ckKey}
+  btn.disabled = true;
+  err.textContent = '';
+
+  const path = S.authMode === 'signup' ? '/auth/signup' : '/auth/login';
+  const body = S.authMode === 'signup'
+    ? {email, password:pw, name, chaoskey_api_key: ckKey}
     : {email, password:pw};
 
-  const {ok,data} = await api(path,{method:'POST',body:JSON.stringify(body)});
-  if (!ok) return err.textContent = '⚠ ' + (data.error||'Auth failed');
+  const {ok, data} = await api(path, {method:'POST', body:JSON.stringify(body)});
+  if (ok) {
+    S.me = {email:data.email, name:data.name, color:data.color};
+    enterApp();
+  } else {
+    err.textContent = '⚠ ' + (data.error || 'Authentication failed');
+    btn.disabled = false;
+  }
+}
 
-  S.me = {email:data.email,name:data.name,color:data.color};
-  enterApp();
+async function doLogout() {
+  await api('/auth/logout', {method:'POST'});
+  location.reload();
 }
 
 async function checkSession() {
-  const {ok,data} = await api('/auth/me');
+  const {ok, data} = await api('/auth/me');
   if (ok && data.authenticated) {
-    S.me = {email:data.email,name:data.name,color:data.color};
+    S.me = {email:data.email, name:data.name, color:data.color};
     enterApp();
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  APP INIT
+//  App
 // ════════════════════════════════════════════════════════════════
 function enterApp() {
   $('auth').classList.add('hidden');
   $('app').classList.remove('hidden');
 
+  $('my-avatar').textContent = initials(S.me.name);
+  $('my-avatar').style.background = S.me.color;
   $('my-name').textContent = S.me.name;
   $('my-email').textContent = S.me.email;
 
@@ -1267,17 +1284,17 @@ function enterApp() {
     if (S.activeContact) {
       const area = $('messages-area');
       area.dataset.hash = '';
-      await loadThread(S.activeContact.email,false);
+      await loadThread(S.activeContact.email, false);
     }
-  }, 2500);
+  }, 3000);
 }
 
 // ════════════════════════════════════════════════════════════════
-//  INBOX
+//  Inbox
 // ════════════════════════════════════════════════════════════════
 async function loadInbox() {
-  const {ok,data} = await api('/msg/inbox');
-  if (!ok) return;
+  const {ok, data} = await api('/msg/inbox');
+  if (!ok || !Array.isArray(data)) return;
   S.threads = data;
   renderThreadList();
 }
@@ -1288,36 +1305,45 @@ function renderThreadList() {
     el.innerHTML = `<div class="no-threads">No conversations</div>`;
     return;
   }
-  el.innerHTML = S.threads.map(t=>`
-    <div class="thread-item"
-      onclick="openThread('${t.contact}','${t.name}','${t.color}')">
-      <div class="avatar" style="background:${t.color}">
-        ${initials(t.name)}
+
+  el.innerHTML = S.threads.map(t => `
+    <div class="thread-item ${S.activeContact?.email === t.contact ? 'active' : ''}"
+         onclick="openThread('${t.contact}','${t.name}','${t.color}')">
+      <div class="avatar" style="background:${t.color}">${initials(t.name)}</div>
+      <div class="thread-info">
+        <div class="thread-name">${esc(t.name)}</div>
+        <div class="thread-email">${esc(t.contact)}</div>
       </div>
-      <div>${esc(t.name)}</div>
+      <div class="thread-time">${fmtDate(t.last_at)}</div>
     </div>`).join('');
 }
 
 // ════════════════════════════════════════════════════════════════
-//  THREAD
+//  Thread
 // ════════════════════════════════════════════════════════════════
-function openThread(email,name,color){
-  S.activeContact={email,name,color};
+function openThread(email, name, color) {
+  S.activeContact = {email, name, color};
+
+  $('contact-name').textContent = name;
+  $('contact-email').textContent = email;
+
+  $('empty-state').style.display = 'none';
   $('chat-view').classList.add('active');
-  loadThread(email,true);
+
+  loadThread(email, true);
 }
 
-async function loadThread(email,scroll=true){
-  const {ok,data} = await api(`/msg/thread?with=${email}`);
-  if (!ok) return;
+async function loadThread(email, scrollToBottom=true) {
+  const {ok, data} = await api(`/msg/thread?with=${encodeURIComponent(email)}`);
+  if (!ok || !Array.isArray(data)) return;
 
   const area = $('messages-area');
 
-  let html='';
-  for(const m of data){
-    const mine = m.from===S.me.email;
-    html+=`
-      <div class="msg-group ${mine?'mine':'theirs'}">
+  let html = '';
+  for (const m of data) {
+    const mine = m.from === S.me.email;
+    html += `
+      <div class="msg-group ${mine ? 'mine' : 'theirs'}">
         <div class="bubble">${esc(m.text)}</div>
         <div class="msg-meta">${fmtTime(m.sent_at)}</div>
       </div>`;
@@ -1328,16 +1354,15 @@ async function loadThread(email,scroll=true){
   if (area.dataset.hash !== newHash) {
     area.innerHTML = html;
     area.dataset.hash = newHash;
-    if (scroll) area.scrollTop = area.scrollHeight;
+    if (scrollToBottom) area.scrollTop = area.scrollHeight;
   } else if (!area.innerHTML) {
-    // fallback fix
     area.innerHTML = html;
     area.dataset.hash = newHash;
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  SEND (FIXED)
+//  Send (FIXED)
 // ════════════════════════════════════════════════════════════════
 async function sendMessage() {
   const inp = $('compose-input');
@@ -1347,33 +1372,33 @@ async function sendMessage() {
   const btn = $('send-btn');
   btn.disabled = true;
 
-  const {ok,data} = await api('/msg/send',{
-    method:'POST',
-    body:JSON.stringify({
-      recipient:S.activeContact.email,
-      plaintext:txt
-    })
+  const {ok, data} = await api('/msg/send', {
+    method: 'POST',
+    body: JSON.stringify({
+      recipient: S.activeContact.email,
+      plaintext: txt
+    }),
   });
 
   btn.disabled = false;
 
   if (!ok) {
-    toast('✗ ' + (data.error || 'Send failed'),'err');
+    toast('✗ ' + (data.error || 'Send failed'), 'err');
     return;
   }
 
-  inp.value='';
-  inp.style.height='auto';
+  inp.value = '';
+  inp.style.height = 'auto';
 
   const area = $('messages-area');
-  area.dataset.hash='';
+  area.dataset.hash = '';
 
-  await loadThread(S.activeContact.email,true);
+  await loadThread(S.activeContact.email, true);
   await loadInbox();
 }
 
 // ════════════════════════════════════════════════════════════════
-//  BOOT
+//  Boot
 // ════════════════════════════════════════════════════════════════
 checkSession();
 </script>
