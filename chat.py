@@ -1435,10 +1435,11 @@ async function sendMessage() {
     return;
   }
 
-  // Refresh thread + inbox
+// Refresh thread + inbox — clear hash to force re-render
+  const area = $('messages-area');
+  area.dataset.hash = '';
   await loadThread(S.activeContact.email, true);
   loadInbox();
-}
 
 // ════════════════════════════════════════════════════════════════
 //  Burn
