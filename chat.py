@@ -67,11 +67,23 @@ CORS(app, supports_credentials=True)
 if USE_POSTGRES:
     import psycopg2
     import psycopg2.extras
+    import urllib.parse as up
 
     def _pg_url():
-        url = DATABASE_URL
+        url = (DATABASE_URL or "").strip()
+
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql://", 1)
+
+        # Remove ANY channel_binding param completely
+        parsed = up.urlparse(url)
+        qs = up.parse_qs(parsed.query)
+
+        qs.pop("channel_binding", None)  # 🔥 remove bad param
+
+        new_query = up.urlencode(qs, doseq=True)
+        url = up.urlunparse(parsed._replace(query=new_query))
+
         return url
 
     def get_db():
@@ -95,28 +107,6 @@ if USE_POSTGRES:
 
     def db_commit():
         get_db().commit()
-
-else:
-    def get_db():
-        if "db" not in g:
-            g.db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-            g.db.row_factory = sqlite3.Row
-            g.db.execute("PRAGMA journal_mode=WAL")
-            g.db.execute("PRAGMA foreign_keys=ON")
-        return g.db
-
-    @app.teardown_appcontext
-    def close_db(exc):
-        db = g.pop("db", None)
-        if db:
-            db.close()
-
-    def db_exec(sql, params=()):
-        return get_db().execute(sql, params)
-
-    def db_commit():
-        get_db().commit()
-
 # ── Schema ────────────────────────────────────────────────────────────────────
 _AI = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 _UNIQUE_IDX = "-- index exists" if USE_POSTGRES else \
@@ -1531,7 +1521,10 @@ def index():
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
-init_db()
+try:
+    init_db()
+except Exception as e:
+    log.error(f"DB init failed: {e}")
 
 if __name__ == "__main__":
     log.info(f"BurnChat starting on port {PORT}")
