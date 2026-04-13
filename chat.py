@@ -1321,10 +1321,15 @@ function enterApp() {
   }
 
   loadInbox();
-  S.pollTimer = setInterval(() => {
-    loadInbox();
-    if (S.activeContact) loadThread(S.activeContact.email, false);
-  }, 3500);
+      setInterval(async () => {
+  await loadInbox();
+  if (S.activeContact) {
+    const area = $('messages-area');
+    area.dataset.hash = '';
+    await loadThread(S.activeContact.email, false);
+  }
+}, 2500);
+ 
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1374,15 +1379,22 @@ async function loadThread(email, scrollToBottom=true) {
   const {ok, data} = await api(`/msg/thread?with=${encodeURIComponent(email)}`);
   if (!ok || !Array.isArray(data)) return;
 
-  const area = $('messages-area');
-  if (!data.length) {
-    area.innerHTML = `
-      <div style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.5rem;color:var(--dust);text-align:center;">
-        <div style="font-size:1.8rem">🔐</div>
-        <div style="font-family:'Fira Code',monospace;font-size:.78rem">No messages yet. Say hello!</div>
-      </div>`;
-    return;
-  }
+const area = $('messages-area');
+
+const tempMsg = {
+  from: S.me.email,
+  text: txt,
+  sent_at: new Date().toISOString(),
+  cipher: ''
+};
+
+// Add instantly to UI
+area.innerHTML += `
+  <div class="msg-group mine">
+    <div class="bubble">${esc(tempMsg.text)}</div>
+    <div class="msg-meta">${fmtTime(tempMsg.sent_at)}</div>
+  </div>`;
+area.scrollTop = area.scrollHeight;
 
   // Group by date
   let html = '';
@@ -1416,31 +1428,38 @@ async function sendMessage() {
   const inp = $('compose-input');
   const txt = inp.value.trim();
   if (!txt || !S.activeContact) return;
+
   const btn = $('send-btn');
   btn.disabled = true;
 
   const {ok, data} = await api('/msg/send', {
     method: 'POST',
-    body: JSON.stringify({recipient: S.activeContact.email, plaintext: txt}),
+    body: JSON.stringify({
+      recipient: S.activeContact.email,
+      plaintext: txt
+    }),
   });
 
-  inp.value = ''; inp.style.height = 'auto';
   btn.disabled = false;
 
   if (!ok) {
     const msg = data.error || 'Send failed';
     toast('✗ ' + msg, 'err', 5000);
-    inp.value = txt;  // restore text so user doesn't lose it
-    autoResize(inp);
     return;
   }
 
-// Refresh thread + inbox — clear hash to force re-render
+  // ✅ Clear input
+  inp.value = '';
+  inp.style.height = 'auto';
+
+  // ✅ FORCE inbox refresh AFTER backend commit
+  await loadInbox();
+
+  // ✅ Force thread reload
   const area = $('messages-area');
-  area.dataset.hash = '';
+  area.dataset.hash = ''; // bust cache
   await loadThread(S.activeContact.email, true);
-  loadInbox();
-  }
+}
 
 // ════════════════════════════════════════════════════════════════
 //  Burn
