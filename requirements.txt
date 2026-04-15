@@ -4,3 +4,4 @@ requests
 bcrypt
 psycopg2-binary
 cryptography
+gunicorn
