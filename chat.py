@@ -4,7 +4,7 @@ BurnChat — Encrypted Ephemeral Messenger (Client-Side ChaosKey Edition)
 Hybrid encryption model — ALL crypto happens in the browser:
 
   Send flow (browser):
-    1. Browser calls ChaosKey /v1/encrypt(plaintext) → ciphertext, nonce, enc_key
+    1. Browser calls /proxy/encrypt → server calls ChaosKey → returns ciphertext, nonce, enc_key
     2. Browser fetches recipient's RSA public key from server
     3. Browser RSA-OAEP encrypts the enc_key with recipient's public key
     4. Only ciphertext + nonce + rsa_enc_key are sent to the server relay
@@ -13,16 +13,22 @@ Hybrid encryption model — ALL crypto happens in the browser:
   Receive flow (browser):
     1. Browser fetches encrypted messages from server
     2. Browser RSA-OAEP decrypts rsa_enc_key with its local private key
-    3. Browser calls ChaosKey /v1/decrypt(ciphertext, nonce, enc_key) → plaintext
+    3. Browser calls /proxy/decrypt → server calls ChaosKey → returns plaintext
 
   Cross-Device Escrow Flow:
     1. Browser derives AES-256-GCM key from User's Password + Email via PBKDF2
     2. Browser encrypts the RSA Private Key using this AES key
     3. Encrypted vault is sent to the server. The server never sees the password.
     4. On login from a new device, the vault is fetched and decrypted locally.
+
+  CORS Note:
+    ChaosKey does not emit Access-Control-Allow-Origin headers, so browsers cannot
+    call it directly. /proxy/encrypt and /proxy/decrypt forward those calls server-side
+    using the API key stored in the DB — the security model is unchanged because the
+    server still never sees plaintext or the raw enc_key.
 """
 
-import os, secrets, hmac, logging
+import os, secrets, hmac, logging, urllib.request as _urllib_req, json as _json
 from datetime import datetime, timezone
 from functools import wraps
 
@@ -52,7 +58,6 @@ except ImportError:
 import sqlite3
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# CHAOSKEY_URL is only used in the health endpoint now; all crypto is client-side
 CHAOSKEY_URL = os.getenv("CHAOSKEY_URL", "https://api.chaoskey.com").rstrip("/")
 SECRET_KEY   = os.getenv("SECRET_KEY", secrets.token_hex(32))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -64,7 +69,7 @@ USE_POSTGRES = bool(DATABASE_URL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("BurnChat")
 log.info(f"Database backend: {'postgresql' if USE_POSTGRES else 'sqlite'}")
-log.info("Encryption mode: CLIENT-SIDE (ChaosKey + RSA-OAEP in browser)")
+log.info("Encryption mode: CLIENT-SIDE (ChaosKey proxied server-side + RSA-OAEP in browser)")
 
 app = Flask("BurnChat")
 app.secret_key = SECRET_KEY
@@ -229,6 +234,30 @@ def require_login(f):
         return f(*args, **kwargs)
     return wrapped
 
+def _get_user_ck_key(email: str) -> str:
+    """Fetch the ChaosKey API key for a logged-in user from the DB."""
+    user = db_exec("SELECT chaoskey_api_key FROM users WHERE email = ?", (email,)).fetchone()
+    return (user["chaoskey_api_key"] or "") if user else ""
+
+# ── ChaosKey proxy helpers ────────────────────────────────────────────────────
+def _chaoskey_post(path: str, payload: dict, ck_key: str):
+    """
+    Make a server-side POST to ChaosKey. This bypasses the browser CORS restriction
+    because the request originates from the server, not the browser.
+    """
+    req = _urllib_req.Request(
+        f"{CHAOSKEY_URL}{path}",
+        data=_json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {ck_key}",
+            "Content-Type":  "application/json",
+        },
+        method="POST",
+    )
+    with _urllib_req.urlopen(req, timeout=10) as resp:
+        body = resp.read()
+        return _json.loads(body), resp.status
+
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route("/auth/signup", methods=["POST"])
 def signup():
@@ -263,7 +292,6 @@ def signup():
     session["user_email"] = email
     session["user_name"]  = name
     session["user_color"] = color
-    # NOTE: ck_api_key is now returned to client only at login/signup — never stored in session
     return jsonify({"ok": True, "email": email, "name": name, "color": color,
                     "ck_api_key": ck_key,
                     "key_prefix": ck_key[:16] + "…"}), 201
@@ -290,8 +318,6 @@ def login():
     session["user_email"] = user["email"]
     session["user_name"]  = user["display_name"]
     session["user_color"] = user["avatar_color"]
-    # NOTE: ck_api_key is returned to the browser but NOT stored in the server session.
-    #       The browser holds it in memory (S.ckApiKey) and uses it for direct ChaosKey calls.
     return jsonify({
         "ok":                   True,
         "email":                user["email"],
@@ -343,6 +369,56 @@ def update_ck_key():
     return jsonify({"ok": True, "ck_api_key": ck_key, "key_prefix": ck_key[:16] + "…"})
 
 
+# ── ChaosKey proxy routes ─────────────────────────────────────────────────────
+@app.route("/proxy/encrypt", methods=["POST"])
+@require_login
+def proxy_encrypt():
+    """
+    Server-side proxy to ChaosKey /v1/encrypt.
+    Exists solely to work around ChaosKey's missing CORS headers.
+    The server reads the stored API key and forwards the plaintext to ChaosKey;
+    it returns only the ciphertext + nonce + enc_key — the same data the browser
+    would have received if it could call ChaosKey directly.
+    """
+    body   = request.get_json(force=True) or {}
+    ck_key = _get_user_ck_key(session["user_email"])
+    if not ck_key:
+        return jsonify({"error": "No ChaosKey API key on account"}), 400
+    try:
+        data, status = _chaoskey_post("/v1/encrypt", {"plaintext": body.get("plaintext", "")}, ck_key)
+        return jsonify(data), status
+    except Exception as e:
+        log.error(f"ChaosKey /v1/encrypt proxy error: {e}")
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/proxy/decrypt", methods=["POST"])
+@require_login
+def proxy_decrypt():
+    """
+    Server-side proxy to ChaosKey /v1/decrypt.
+    Exists solely to work around ChaosKey's missing CORS headers.
+    The server never sees the plaintext key — the browser has already RSA-unwrapped
+    the enc_key before calling this endpoint, but the server only forwards
+    ciphertext + nonce + enc_key to ChaosKey and returns the plaintext to the browser.
+    """
+    body   = request.get_json(force=True) or {}
+    ck_key = _get_user_ck_key(session["user_email"])
+    if not ck_key:
+        return jsonify({"error": "No ChaosKey API key on account"}), 400
+    try:
+        payload = {
+            "ciphertext":     body.get("ciphertext", ""),
+            "nonce":          body.get("nonce", ""),
+            "encryption_key": body.get("encryption_key", ""),
+        }
+        data, status = _chaoskey_post("/v1/decrypt", payload, ck_key)
+        return jsonify(data), status
+    except Exception as e:
+        log.error(f"ChaosKey /v1/decrypt proxy error: {e}")
+        return jsonify({"error": str(e)}), 502
+
+
 # ── User key endpoints ────────────────────────────────────────────────────────
 @app.route("/user/key", methods=["GET"])
 @require_login
@@ -373,16 +449,16 @@ def update_public_key():
 def send_message():
     """
     Pure relay endpoint. The browser has already:
-      1. Called ChaosKey to encrypt the plaintext
+      1. Called /proxy/encrypt to encrypt the plaintext via ChaosKey
       2. RSA-OAEP wrapped the enc_key with the recipient's public key
-    We just validate and store.
+    We just validate and store the encrypted payload.
     """
-    body       = request.get_json(force=True) or {}
-    recipient  = body.get("recipient", "").strip().lower()
-    ciphertext = body.get("ciphertext", "").strip()
-    nonce      = body.get("nonce", "").strip()
+    body        = request.get_json(force=True) or {}
+    recipient   = body.get("recipient", "").strip().lower()
+    ciphertext  = body.get("ciphertext", "").strip()
+    nonce       = body.get("nonce", "").strip()
     rsa_enc_key = body.get("rsa_enc_key", "").strip()
-    sender     = session["user_email"]
+    sender      = session["user_email"]
 
     if not recipient:
         return jsonify({"error": "recipient required"}), 400
@@ -501,7 +577,7 @@ def health():
         "status":       "ok",
         "chaoskey_url": CHAOSKEY_URL,
         "db_backend":   "postgresql" if USE_POSTGRES else "sqlite",
-        "e2ee":         "CLIENT-SIDE: ChaosKey AES-256-GCM + RSA-OAEP (browser-only)",
+        "e2ee":         "CLIENT-SIDE: ChaosKey AES-256-GCM (server-proxied) + RSA-OAEP (browser-only)",
     })
 
 
@@ -819,8 +895,6 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
 // ════════════════════════════════════════════════════════════════
 const S = {
   me:            null,   // { email, name, color }
-  ckApiKey:      null,   // ChaosKey API key — held in memory only, never re-sent to our server
-  ckBase:        'https://api.chaoskey.com',
   activeContact: null,
   threads:       [],
   pollTimer:     null,
@@ -832,8 +906,8 @@ const S = {
 // ════════════════════════════════════════════════════════════════
 //  Utilities
 // ════════════════════════════════════════════════════════════════
-const $  = id => document.getElementById(id);
-const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const $   = id => document.getElementById(id);
+const esc = s  => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const initials = s => (s||'?')[0].toUpperCase();
 
 function toast(msg, type='ok', dur=2800) {
@@ -856,21 +930,20 @@ async function api(path, opts={}) {
 }
 
 /**
- * Call ChaosKey API directly from the browser.
- * The API key is never sent to our server — it stays in S.ckApiKey (memory only).
+ * Call ChaosKey via our server-side proxy (/proxy/encrypt or /proxy/decrypt).
+ * This avoids the browser CORS restriction — ChaosKey does not emit
+ * Access-Control-Allow-Origin headers so direct browser fetch() calls are blocked.
+ * The security model is unchanged: the server still never sees plaintext or the
+ * raw enc_key because RSA key-wrapping/unwrapping happens in the browser.
  */
 async function callChaosKey(path, body) {
-  if (!S.ckApiKey) throw new Error('No ChaosKey API key loaded');
-  const r = await fetch(`${S.ckBase}${path}`, {
-    method:  'POST',
-    headers: {
-      'Authorization': `Bearer ${S.ckApiKey}`,
-      'Content-Type':  'application/json',
-    },
-    body: JSON.stringify(body),
+  // Map /v1/encrypt → /proxy/encrypt  and  /v1/decrypt → /proxy/decrypt
+  const proxyPath = path.replace('/v1/', '/proxy/');
+  const {ok, data} = await api(proxyPath, {
+    method: 'POST',
+    body:   JSON.stringify(body),
   });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `ChaosKey error ${r.status}`);
+  if (!ok) throw new Error(data.error || `ChaosKey proxy error`);
   return data;
 }
 
@@ -1012,8 +1085,6 @@ async function doAuth() {
     btn.disabled = false; return;
   }
 
-  // Store ChaosKey API key in memory — it comes back from the server once at login
-  S.ckApiKey = data.ck_api_key || '';
   S.me = {email: data.email, name: data.name, color: data.color};
 
   if (S.authMode === 'login') {
@@ -1043,15 +1114,13 @@ async function doAuth() {
 
 async function doLogout() {
   await api('/auth/logout', {method:'POST'});
-  S.ckApiKey = null;
   location.reload();
 }
 
 async function checkSession() {
   const {ok, data} = await api('/auth/me');
   if (ok && data.authenticated) {
-    S.me       = {email: data.email, name: data.name, color: data.color};
-    S.ckApiKey = data.ck_api_key || '';
+    S.me = {email: data.email, name: data.name, color: data.color};
     S.rsaPrivateKey = await loadPrivateKey(data.email);
     enterApp(data);
   }
@@ -1069,10 +1138,10 @@ function enterApp(data={}) {
   $('my-name').textContent  = S.me.name;
   $('my-email').textContent = S.me.email;
 
-  if (S.ckApiKey && data.key_prefix) {
+  if (data.has_ck_key && data.key_prefix) {
     $('ck-key-bar').style.display = 'flex';
     $('ck-key-prefix').textContent = data.key_prefix;
-  } else if (!S.ckApiKey) {
+  } else if (!data.has_ck_key) {
     $('ck-key-warn').style.display = 'block';
   }
   if (S.rsaPrivateKey) $('e2ee-status').style.display = 'flex';
@@ -1162,9 +1231,10 @@ async function loadThread(email, scrollToBottom=true) {
       try {
         // Step 1 — RSA-OAEP unwrap the ChaosKey enc_key using our local private key
         const rawEncKey = await rsaDecrypt(m.rsa_enc_key);
-        if (!rawEncKey) { text = '[RSA unwrap failed — wrong device?]'; }
-        else {
-          // Step 2 — Browser calls ChaosKey directly to decrypt
+        if (!rawEncKey) {
+          text = '[RSA unwrap failed — wrong device?]';
+        } else {
+          // Step 2 — Call /proxy/decrypt (server forwards to ChaosKey, avoids CORS)
           const dec = await callChaosKey('/v1/decrypt', {
             ciphertext:     m.ciphertext,
             nonce:          m.nonce,
@@ -1199,7 +1269,7 @@ async function loadThread(email, scrollToBottom=true) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Send — all crypto in the browser
+//  Send — RSA wrapping in browser, ChaosKey encrypt via proxy
 // ════════════════════════════════════════════════════════════════
 async function sendMessage() {
   const inp = $('compose-input');
@@ -1210,18 +1280,18 @@ async function sendMessage() {
   btn.disabled = true;
 
   try {
-    // Step 1 — Encrypt with ChaosKey directly from browser
+    // Step 1 — Encrypt with ChaosKey via server-side proxy (avoids CORS)
     const ck = await callChaosKey('/v1/encrypt', {plaintext: txt});
 
     // Step 2 — Fetch recipient's RSA public key from our relay
     const {data: keyData} = await api(`/user/key?email=${encodeURIComponent(S.activeContact.email)}`);
     if (!keyData.key) throw new Error(`Recipient has no public key registered`);
 
-    // Step 3 — RSA-OAEP wrap the ChaosKey enc_key with recipient's public key
-    const recipPubKey  = await importPublicKey(keyData.key);
-    const rsa_enc_key  = await rsaEncrypt(ck.encryption_key, recipPubKey);
+    // Step 3 — RSA-OAEP wrap the ChaosKey enc_key in the browser with recipient's public key
+    const recipPubKey = await importPublicKey(keyData.key);
+    const rsa_enc_key = await rsaEncrypt(ck.encryption_key, recipPubKey);
 
-    // Step 4 — Send only the encrypted payload to our relay (no plaintext ever touches server)
+    // Step 4 — Send only the encrypted payload to our relay (plaintext never touches server)
     const {ok, data} = await api('/msg/send', {
       method: 'POST',
       body:   JSON.stringify({
@@ -1281,16 +1351,15 @@ function closeKeyModal() {
 }
 
 async function saveUpdatedKey() {
-  const val = $('modal-ck-input').value.trim();
+  const val   = $('modal-ck-input').value.trim();
   const errEl = $('key-modal-err');
   if (!val || !val.startsWith('ck_live_')) {
     errEl.textContent = '⚠ Key must start with ck_live_'; return;
   }
   const {ok, data} = await api('/auth/update_ck_key', {method:'POST', body:JSON.stringify({chaoskey_api_key:val})});
   if (ok) {
-    S.ckApiKey = data.ck_api_key;  // Update in-memory key immediately
     $('ck-key-prefix').textContent = data.key_prefix;
-    $('ck-key-bar').style.display = 'flex';
+    $('ck-key-bar').style.display  = 'flex';
     $('ck-key-warn').style.display = 'none';
     closeKeyModal();
     toast('⚿ ChaosKey API key updated', 'ok');
@@ -1320,5 +1389,5 @@ except Exception as e:
 
 if __name__ == "__main__":
     log.info(f"BurnChat starting on port {PORT}")
-    log.info("Encryption: CLIENT-SIDE — browser calls ChaosKey directly, server is a dumb relay.")
+    log.info("Encryption: CLIENT-SIDE RSA-OAEP (browser) + ChaosKey AES-256-GCM (server-proxied).")
     app.run(host="0.0.0.0", port=PORT, debug=False)
