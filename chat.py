@@ -4,16 +4,19 @@ BurnChat — Encrypted Ephemeral Messenger (Client-Side ChaosKey Edition)
 Hybrid encryption model — ALL crypto happens in the browser:
 
   Send flow (browser):
-    1. Browser calls /proxy/encrypt → server calls ChaosKey → returns ciphertext, nonce, enc_key
+    1. Browser calls /proxy/encrypt → server calls ChaosKey → ciphertext, nonce, enc_key
     2. Browser fetches recipient's RSA public key from server
-    3. Browser RSA-OAEP encrypts the enc_key with recipient's public key
-    4. Only ciphertext + nonce + rsa_enc_key are sent to the server relay
-    5. Server stores encrypted payload — never sees plaintext or raw enc_key
+    3. Browser RSA-OAEP encrypts enc_key with recipient's public key  → rsa_enc_key
+    4. Browser RSA-OAEP encrypts enc_key with its OWN public key      → sender_enc_key
+       (so the sender can read their own sent messages)
+    5. ciphertext + nonce + rsa_enc_key + sender_enc_key sent to relay
+    6. Server stores encrypted payload — never sees plaintext or raw enc_key
 
   Receive flow (browser):
     1. Browser fetches encrypted messages from server
-    2. Browser RSA-OAEP decrypts rsa_enc_key with its local private key
-    3. Browser calls /proxy/decrypt → server calls ChaosKey → returns plaintext
+    2. For received messages: RSA-OAEP decrypts rsa_enc_key with local private key
+       For sent messages:     RSA-OAEP decrypts sender_enc_key with local private key
+    3. Browser calls /proxy/decrypt → server calls ChaosKey → plaintext
 
   Cross-Device Escrow Flow:
     1. Browser derives AES-256-GCM key from User's Password + Email via PBKDF2
@@ -69,7 +72,7 @@ USE_POSTGRES = bool(DATABASE_URL)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("BurnChat")
 log.info(f"Database backend: {'postgresql' if USE_POSTGRES else 'sqlite'}")
-log.info("Encryption mode: CLIENT-SIDE (ChaosKey proxied server-side + RSA-OAEP in browser)")
+log.info("Encryption mode: CLIENT-SIDE (ChaosKey proxied + RSA-OAEP dual-wrap in browser)")
 
 app = Flask("BurnChat")
 app.secret_key = SECRET_KEY
@@ -142,13 +145,14 @@ CREATE TABLE IF NOT EXISTS users (
     encrypted_private_key TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender       TEXT NOT NULL,
-    recipient    TEXT NOT NULL,
-    ciphertext   TEXT NOT NULL,
-    nonce        TEXT NOT NULL DEFAULT '',
-    enc_key      TEXT NOT NULL DEFAULT '',
-    sent_at      TEXT NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender          TEXT NOT NULL,
+    recipient       TEXT NOT NULL,
+    ciphertext      TEXT NOT NULL,
+    nonce           TEXT NOT NULL DEFAULT '',
+    enc_key         TEXT NOT NULL DEFAULT '',
+    sender_enc_key  TEXT NOT NULL DEFAULT '',
+    sent_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(sender, recipient);
 """
@@ -166,13 +170,14 @@ SCHEMA_PG_STMTS = [
         encrypted_private_key TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS messages (
-        id           SERIAL PRIMARY KEY,
-        sender       TEXT NOT NULL,
-        recipient    TEXT NOT NULL,
-        ciphertext   TEXT NOT NULL,
-        nonce        TEXT NOT NULL DEFAULT '',
-        enc_key      TEXT NOT NULL DEFAULT '',
-        sent_at      TEXT NOT NULL
+        id              SERIAL PRIMARY KEY,
+        sender          TEXT NOT NULL,
+        recipient       TEXT NOT NULL,
+        ciphertext      TEXT NOT NULL,
+        nonce           TEXT NOT NULL DEFAULT '',
+        enc_key         TEXT NOT NULL DEFAULT '',
+        sender_enc_key  TEXT NOT NULL DEFAULT '',
+        sent_at         TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(sender, recipient)",
 ]
@@ -182,6 +187,7 @@ PG_MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS chaoskey_api_key TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS encrypted_private_key TEXT",
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_enc_key TEXT NOT NULL DEFAULT ''",
 ]
 
 def init_db():
@@ -200,9 +206,9 @@ def init_db():
             db = sqlite3.connect(DB_PATH)
             db.executescript(SCHEMA_SQLITE)
             for col, default in [
-                ("avatar_color", "'#ff6b35'"),
-                ("chaoskey_api_key", "NULL"),
-                ("public_key", "NULL"),
+                ("avatar_color",          "'#ff6b35'"),
+                ("chaoskey_api_key",      "NULL"),
+                ("public_key",            "NULL"),
                 ("encrypted_private_key", "NULL"),
             ]:
                 try:
@@ -210,6 +216,11 @@ def init_db():
                     db.commit()
                 except Exception:
                     pass
+            try:
+                db.execute("ALTER TABLE messages ADD COLUMN sender_enc_key TEXT NOT NULL DEFAULT ''")
+                db.commit()
+            except Exception:
+                pass
             db.commit()
             db.close()
     log.info("Database ready.")
@@ -235,15 +246,14 @@ def require_login(f):
     return wrapped
 
 def _get_user_ck_key(email: str) -> str:
-    """Fetch the ChaosKey API key for a logged-in user from the DB."""
     user = db_exec("SELECT chaoskey_api_key FROM users WHERE email = ?", (email,)).fetchone()
     return (user["chaoskey_api_key"] or "") if user else ""
 
 # ── ChaosKey proxy helpers ────────────────────────────────────────────────────
 def _chaoskey_post(path: str, payload: dict, ck_key: str):
     """
-    Make a server-side POST to ChaosKey. This bypasses the browser CORS restriction
-    because the request originates from the server, not the browser.
+    Server-side POST to ChaosKey — bypasses browser CORS restriction because the
+    request originates from the server, not the browser.
     """
     req = _urllib_req.Request(
         f"{CHAOSKEY_URL}{path}",
@@ -255,8 +265,7 @@ def _chaoskey_post(path: str, payload: dict, ck_key: str):
         method="POST",
     )
     with _urllib_req.urlopen(req, timeout=10) as resp:
-        body = resp.read()
-        return _json.loads(body), resp.status
+        return _json.loads(resp.read()), resp.status
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route("/auth/signup", methods=["POST"])
@@ -292,9 +301,16 @@ def signup():
     session["user_email"] = email
     session["user_name"]  = name
     session["user_color"] = color
-    return jsonify({"ok": True, "email": email, "name": name, "color": color,
-                    "ck_api_key": ck_key,
-                    "key_prefix": ck_key[:16] + "…"}), 201
+    return jsonify({
+        "ok":                    True,
+        "email":                 email,
+        "name":                  name,
+        "color":                 color,
+        "key_prefix":            ck_key[:16] + "…",
+        "has_ck_key":            True,
+        "public_key":            public_key,
+        "encrypted_private_key": enc_priv,
+    }), 201
 
 
 @app.route("/auth/login", methods=["POST"])
@@ -319,14 +335,13 @@ def login():
     session["user_name"]  = user["display_name"]
     session["user_color"] = user["avatar_color"]
     return jsonify({
-        "ok":                   True,
-        "email":                user["email"],
-        "name":                 user["display_name"],
-        "color":                user["avatar_color"],
-        "ck_api_key":           ck_key,
-        "key_prefix":           (ck_key[:16] + "…") if ck_key else None,
-        "has_ck_key":           bool(ck_key),
-        "public_key":           user["public_key"] or "",
+        "ok":                    True,
+        "email":                 user["email"],
+        "name":                  user["display_name"],
+        "color":                 user["avatar_color"],
+        "key_prefix":            (ck_key[:16] + "…") if ck_key else None,
+        "has_ck_key":            bool(ck_key),
+        "public_key":            user["public_key"] or "",
         "encrypted_private_key": user["encrypted_private_key"] or "",
     })
 
@@ -342,17 +357,19 @@ def me():
     if "user_email" not in session:
         return jsonify({"authenticated": False}), 200
     user = db_exec(
-        "SELECT chaoskey_api_key FROM users WHERE email = ?", (session["user_email"],)
+        "SELECT chaoskey_api_key, public_key, encrypted_private_key FROM users WHERE email = ?",
+        (session["user_email"],)
     ).fetchone()
     ck_key = user["chaoskey_api_key"] if user else ""
     return jsonify({
-        "authenticated": True,
-        "email":         session["user_email"],
-        "name":          session["user_name"],
-        "color":         session.get("user_color", "#ff6b35"),
-        "has_ck_key":    bool(ck_key),
-        "ck_api_key":    ck_key or "",
-        "key_prefix":    (ck_key[:16] + "…") if ck_key else None,
+        "authenticated":         True,
+        "email":                 session["user_email"],
+        "name":                  session["user_name"],
+        "color":                 session.get("user_color", "#ff6b35"),
+        "has_ck_key":            bool(ck_key),
+        "key_prefix":            (ck_key[:16] + "…") if ck_key else None,
+        "public_key":            (user["public_key"] or "") if user else "",
+        "encrypted_private_key": (user["encrypted_private_key"] or "") if user else "",
     })
 
 
@@ -366,20 +383,14 @@ def update_ck_key():
     db_exec("UPDATE users SET chaoskey_api_key = ? WHERE email = ?",
             (ck_key, session["user_email"]))
     db_commit()
-    return jsonify({"ok": True, "ck_api_key": ck_key, "key_prefix": ck_key[:16] + "…"})
+    return jsonify({"ok": True, "key_prefix": ck_key[:16] + "…"})
 
 
 # ── ChaosKey proxy routes ─────────────────────────────────────────────────────
 @app.route("/proxy/encrypt", methods=["POST"])
 @require_login
 def proxy_encrypt():
-    """
-    Server-side proxy to ChaosKey /v1/encrypt.
-    Exists solely to work around ChaosKey's missing CORS headers.
-    The server reads the stored API key and forwards the plaintext to ChaosKey;
-    it returns only the ciphertext + nonce + enc_key — the same data the browser
-    would have received if it could call ChaosKey directly.
-    """
+    """Proxy /v1/encrypt to ChaosKey server-side (avoids browser CORS block)."""
     body   = request.get_json(force=True) or {}
     ck_key = _get_user_ck_key(session["user_email"])
     if not ck_key:
@@ -395,13 +406,7 @@ def proxy_encrypt():
 @app.route("/proxy/decrypt", methods=["POST"])
 @require_login
 def proxy_decrypt():
-    """
-    Server-side proxy to ChaosKey /v1/decrypt.
-    Exists solely to work around ChaosKey's missing CORS headers.
-    The server never sees the plaintext key — the browser has already RSA-unwrapped
-    the enc_key before calling this endpoint, but the server only forwards
-    ciphertext + nonce + enc_key to ChaosKey and returns the plaintext to the browser.
-    """
+    """Proxy /v1/decrypt to ChaosKey server-side (avoids browser CORS block)."""
     body   = request.get_json(force=True) or {}
     ck_key = _get_user_ck_key(session["user_email"])
     if not ck_key:
@@ -449,16 +454,19 @@ def update_public_key():
 def send_message():
     """
     Pure relay endpoint. The browser has already:
-      1. Called /proxy/encrypt to encrypt the plaintext via ChaosKey
-      2. RSA-OAEP wrapped the enc_key with the recipient's public key
+      1. Called /proxy/encrypt to get ciphertext + nonce + enc_key from ChaosKey
+      2. RSA-OAEP wrapped enc_key with the recipient's public key → rsa_enc_key
+      3. RSA-OAEP wrapped enc_key with the sender's own public key → sender_enc_key
+         (allows the sender to decrypt their own sent messages)
     We just validate and store the encrypted payload.
     """
-    body        = request.get_json(force=True) or {}
-    recipient   = body.get("recipient", "").strip().lower()
-    ciphertext  = body.get("ciphertext", "").strip()
-    nonce       = body.get("nonce", "").strip()
-    rsa_enc_key = body.get("rsa_enc_key", "").strip()
-    sender      = session["user_email"]
+    body           = request.get_json(force=True) or {}
+    recipient      = body.get("recipient", "").strip().lower()
+    ciphertext     = body.get("ciphertext", "").strip()
+    nonce          = body.get("nonce", "").strip()
+    rsa_enc_key    = body.get("rsa_enc_key", "").strip()
+    sender_enc_key = body.get("sender_enc_key", "").strip()
+    sender         = session["user_email"]
 
     if not recipient:
         return jsonify({"error": "recipient required"}), 400
@@ -472,12 +480,12 @@ def send_message():
         return jsonify({"error": f"User '{recipient}' not found on BurnChat"}), 404
 
     db_exec(
-        "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, sent_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (sender, recipient, ciphertext, nonce, rsa_enc_key, now_iso())
+        "INSERT INTO messages (sender, recipient, ciphertext, nonce, enc_key, sender_enc_key, sent_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (sender, recipient, ciphertext, nonce, rsa_enc_key, sender_enc_key, now_iso())
     )
     db_commit()
-    return jsonify({"ok": True, "sent_at": now_iso(), "mode": "client-chaoskey+rsa"}), 201
+    return jsonify({"ok": True, "sent_at": now_iso(), "mode": "client-chaoskey+rsa-dual-wrap"}), 201
 
 
 @app.route("/msg/thread", methods=["GET"])
@@ -490,7 +498,7 @@ def get_thread():
         return jsonify({"error": "?with= required"}), 400
 
     rows = db_exec(
-        "SELECT id, sender, ciphertext, nonce, enc_key, sent_at "
+        "SELECT id, sender, ciphertext, nonce, enc_key, sender_enc_key, sent_at "
         "FROM messages "
         "WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?) "
         "ORDER BY id ASC",
@@ -498,12 +506,13 @@ def get_thread():
     ).fetchall()
 
     return jsonify([{
-        "id":          r["id"],
-        "from":        r["sender"],
-        "ciphertext":  r["ciphertext"],
-        "nonce":       r["nonce"],
-        "rsa_enc_key": r["enc_key"],
-        "sent_at":     r["sent_at"],
+        "id":             r["id"],
+        "from":           r["sender"],
+        "ciphertext":     r["ciphertext"],
+        "nonce":          r["nonce"],
+        "rsa_enc_key":    r["enc_key"],
+        "sender_enc_key": r["sender_enc_key"],
+        "sent_at":        r["sent_at"],
     } for r in rows])
 
 
@@ -577,7 +586,7 @@ def health():
         "status":       "ok",
         "chaoskey_url": CHAOSKEY_URL,
         "db_backend":   "postgresql" if USE_POSTGRES else "sqlite",
-        "e2ee":         "CLIENT-SIDE: ChaosKey AES-256-GCM (server-proxied) + RSA-OAEP (browser-only)",
+        "e2ee":         "ChaosKey AES-256-GCM (server-proxied) + RSA-OAEP dual-wrap (browser-only)",
     })
 
 
@@ -899,8 +908,8 @@ const S = {
   threads:       [],
   pollTimer:     null,
   authMode:      'login',
-  rsaPublicKey:  null,
-  rsaPrivateKey: null,
+  rsaPublicKey:  null,   // own CryptoKey (encrypt-only) — needed to self-wrap at send time
+  rsaPrivateKey: null,   // own CryptoKey (decrypt-only) — needed to unwrap at read time
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -931,19 +940,13 @@ async function api(path, opts={}) {
 
 /**
  * Call ChaosKey via our server-side proxy (/proxy/encrypt or /proxy/decrypt).
- * This avoids the browser CORS restriction — ChaosKey does not emit
- * Access-Control-Allow-Origin headers so direct browser fetch() calls are blocked.
- * The security model is unchanged: the server still never sees plaintext or the
- * raw enc_key because RSA key-wrapping/unwrapping happens in the browser.
+ * Direct browser calls are blocked by ChaosKey's missing CORS headers.
+ * The security model is unchanged: RSA wrapping/unwrapping stays 100% in the browser.
  */
 async function callChaosKey(path, body) {
-  // Map /v1/encrypt → /proxy/encrypt  and  /v1/decrypt → /proxy/decrypt
   const proxyPath = path.replace('/v1/', '/proxy/');
-  const {ok, data} = await api(proxyPath, {
-    method: 'POST',
-    body:   JSON.stringify(body),
-  });
-  if (!ok) throw new Error(data.error || `ChaosKey proxy error`);
+  const {ok, data} = await api(proxyPath, {method:'POST', body:JSON.stringify(body)});
+  if (!ok) throw new Error(data.error || 'ChaosKey proxy error');
   return data;
 }
 
@@ -951,7 +954,6 @@ function autoResize(ta) {
   ta.style.height = 'auto';
   ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
 }
-
 function fmtTime(iso) {
   if (!iso) return '';
   return new Date(iso).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
@@ -966,7 +968,7 @@ function fmtDate(iso) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Cross-Device Key Escrow & RSA Management
+//  RSA key helpers
 // ════════════════════════════════════════════════════════════════
 async function deriveKeyFromPassword(password, email) {
   const enc = new TextEncoder();
@@ -988,11 +990,11 @@ async function genAndRegisterKeys(password, email) {
   const pubRaw  = await crypto.subtle.exportKey('spki', kp.publicKey);
   const pubB64  = btoa(String.fromCharCode(...new Uint8Array(pubRaw)));
   const privRaw = await crypto.subtle.exportKey('pkcs8', kp.privateKey);
-  const privB64 = btoa(String.fromCharCode(...new Uint8Array(privRaw)));
-  localStorage.setItem('bc_priv_' + email, privB64);
+  localStorage.setItem('bc_priv_' + email, btoa(String.fromCharCode(...new Uint8Array(privRaw))));
 
-  const aesKey = await deriveKeyFromPassword(password, email);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  // Encrypt private key with password-derived AES key for cross-device vault
+  const aesKey  = await deriveKeyFromPassword(password, email);
+  const iv      = crypto.getRandomValues(new Uint8Array(12));
   const encPriv = await crypto.subtle.encrypt({name:'AES-GCM', iv}, aesKey, privRaw);
   const combined = new Uint8Array(12 + encPriv.byteLength);
   combined.set(iv);
@@ -1015,17 +1017,13 @@ async function importPublicKey(pubB64) {
   return crypto.subtle.importKey('spki', raw, {name:'RSA-OAEP', hash:'SHA-256'}, false, ['encrypt']);
 }
 
-/** RSA-OAEP encrypt a string with a CryptoKey, returns base64. */
 async function rsaEncrypt(plaintext, cryptoKey) {
   const enc = await crypto.subtle.encrypt(
-    {name:'RSA-OAEP'},
-    cryptoKey,
-    new TextEncoder().encode(plaintext)
+    {name:'RSA-OAEP'}, cryptoKey, new TextEncoder().encode(plaintext)
   );
   return btoa(String.fromCharCode(...new Uint8Array(enc)));
 }
 
-/** RSA-OAEP decrypt a base64 string with the local private key, returns string. */
 async function rsaDecrypt(cipherB64) {
   if (!S.rsaPrivateKey) return null;
   try {
@@ -1036,6 +1034,21 @@ async function rsaDecrypt(cipherB64) {
     );
     return new TextDecoder().decode(dec);
   } catch { return null; }
+}
+
+/**
+ * Ensure S.rsaPublicKey is set.
+ * On signup it's set by genAndRegisterKeys. On login we import it from the server.
+ * This is needed so sendMessage() can self-wrap the enc_key.
+ */
+async function ensureOwnPublicKey() {
+  if (S.rsaPublicKey) return;
+  try {
+    const {data} = await api(`/user/key?email=${encodeURIComponent(S.me.email)}`);
+    if (data.key) S.rsaPublicKey = await importPublicKey(data.key);
+  } catch(e) {
+    console.warn('Could not load own public key:', e);
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1063,11 +1076,11 @@ async function doAuth() {
   btn.disabled = true; err.textContent = '';
 
   let pubB64 = null, encPrivB64 = null;
-
   if (S.authMode === 'signup') {
     try {
       const keys = await genAndRegisterKeys(pw, email);
       pubB64 = keys.pubB64; encPrivB64 = keys.encPrivB64;
+      // S.rsaPublicKey + S.rsaPrivateKey now set
     } catch(e) {
       err.textContent = '⚠ Key generation failed: ' + e.message;
       btn.disabled = false; return;
@@ -1088,8 +1101,10 @@ async function doAuth() {
   S.me = {email: data.email, name: data.name, color: data.color};
 
   if (S.authMode === 'login') {
+    // Try localStorage first (same device)
     S.rsaPrivateKey = await loadPrivateKey(email);
-    // New device: decrypt vault with password
+
+    // New device: decrypt the AES-encrypted vault to recover private key
     if (!S.rsaPrivateKey && data.encrypted_private_key) {
       try {
         const combined = Uint8Array.from(atob(data.encrypted_private_key), c => c.charCodeAt(0));
@@ -1107,6 +1122,11 @@ async function doAuth() {
         toast('⚠ Could not decrypt key vault (wrong password?)', 'err', 5000);
       }
     }
+
+    // Import own public key from server response so we can self-wrap enc_keys at send time
+    if (data.public_key) {
+      try { S.rsaPublicKey = await importPublicKey(data.public_key); } catch {}
+    }
   }
 
   enterApp(data);
@@ -1114,6 +1134,7 @@ async function doAuth() {
 
 async function doLogout() {
   await api('/auth/logout', {method:'POST'});
+  S.rsaPublicKey = null; S.rsaPrivateKey = null;
   location.reload();
 }
 
@@ -1122,6 +1143,9 @@ async function checkSession() {
   if (ok && data.authenticated) {
     S.me = {email: data.email, name: data.name, color: data.color};
     S.rsaPrivateKey = await loadPrivateKey(data.email);
+    if (data.public_key) {
+      try { S.rsaPublicKey = await importPublicKey(data.public_key); } catch {}
+    }
     enterApp(data);
   }
 }
@@ -1149,7 +1173,10 @@ function enterApp(data={}) {
   loadInbox();
   S.pollTimer = setInterval(async () => {
     await loadInbox();
-    if (S.activeContact) { $('messages-area').dataset.hash=''; await loadThread(S.activeContact.email, false); }
+    if (S.activeContact) {
+      $('messages-area').dataset.hash = '';
+      await loadThread(S.activeContact.email, false);
+    }
   }, 3000);
 }
 
@@ -1217,33 +1244,47 @@ async function loadThread(email, scrollToBottom=true) {
   const {ok, data} = await api(`/msg/thread?with=${encodeURIComponent(email)}`);
   if (!ok || !Array.isArray(data)) return;
 
-  const area = $('messages-area');
+  const area     = $('messages-area');
   const resolved = [];
 
   for (const m of data) {
     let text = '[Decryption failed]';
 
     if (!S.rsaPrivateKey) {
-      text = '[No RSA private key on this device]';
-    } else if (!m.rsa_enc_key || !m.ciphertext || !m.nonce) {
+      text = '[No RSA private key — log in again]';
+    } else if (!m.ciphertext || !m.nonce) {
       text = '[Missing encrypted data]';
     } else {
-      try {
-        // Step 1 — RSA-OAEP unwrap the ChaosKey enc_key using our local private key
-        const rawEncKey = await rsaDecrypt(m.rsa_enc_key);
-        if (!rawEncKey) {
-          text = '[RSA unwrap failed — wrong device?]';
-        } else {
-          // Step 2 — Call /proxy/decrypt (server forwards to ChaosKey, avoids CORS)
-          const dec = await callChaosKey('/v1/decrypt', {
-            ciphertext:     m.ciphertext,
-            nonce:          m.nonce,
-            encryption_key: rawEncKey,
-          });
-          text = dec.plaintext ?? '[Empty plaintext]';
+      const isMine = m.from === S.me.email;
+
+      /*
+       * Dual-wrap strategy:
+       *   Sent messages:     enc_key was RSA-wrapped with OUR OWN public key → sender_enc_key
+       *   Received messages: enc_key was RSA-wrapped with OUR public key      → rsa_enc_key
+       * In both cases OUR private key can unwrap the correct field.
+       */
+      const wrappedKey = isMine ? m.sender_enc_key : m.rsa_enc_key;
+
+      if (!wrappedKey) {
+        text = isMine
+          ? '[Sent before self-wrap — cannot read own copy]'
+          : '[Missing encrypted key]';
+      } else {
+        try {
+          const rawEncKey = await rsaDecrypt(wrappedKey);
+          if (!rawEncKey) {
+            text = '[RSA unwrap failed — key mismatch or wrong device]';
+          } else {
+            const dec = await callChaosKey('/v1/decrypt', {
+              ciphertext:     m.ciphertext,
+              nonce:          m.nonce,
+              encryption_key: rawEncKey,
+            });
+            text = dec.plaintext ?? '[Empty plaintext]';
+          }
+        } catch(e) {
+          text = `[${e.message || 'Decryption error'}]`;
         }
-      } catch(e) {
-        text = `[${e.message || 'Error'}]`;
       }
     }
     resolved.push({...m, resolved: text});
@@ -1269,7 +1310,7 @@ async function loadThread(email, scrollToBottom=true) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Send — RSA wrapping in browser, ChaosKey encrypt via proxy
+//  Send — dual RSA wrap in browser, ChaosKey encrypt via proxy
 // ════════════════════════════════════════════════════════════════
 async function sendMessage() {
   const inp = $('compose-input');
@@ -1280,25 +1321,33 @@ async function sendMessage() {
   btn.disabled = true;
 
   try {
-    // Step 1 — Encrypt with ChaosKey via server-side proxy (avoids CORS)
+    // 1 — Encrypt with ChaosKey via server-side proxy (avoids CORS)
     const ck = await callChaosKey('/v1/encrypt', {plaintext: txt});
 
-    // Step 2 — Fetch recipient's RSA public key from our relay
-    const {data: keyData} = await api(`/user/key?email=${encodeURIComponent(S.activeContact.email)}`);
-    if (!keyData.key) throw new Error(`Recipient has no public key registered`);
+    // 2 — Fetch recipient's public key
+    const {data: recipKeyData} = await api(`/user/key?email=${encodeURIComponent(S.activeContact.email)}`);
+    if (!recipKeyData.key) throw new Error('Recipient has no public key registered');
 
-    // Step 3 — RSA-OAEP wrap the ChaosKey enc_key in the browser with recipient's public key
-    const recipPubKey = await importPublicKey(keyData.key);
-    const rsa_enc_key = await rsaEncrypt(ck.encryption_key, recipPubKey);
+    // 3 — Make sure our own public key is loaded (for the sender copy)
+    await ensureOwnPublicKey();
+    if (!S.rsaPublicKey) throw new Error('Your public key is not available — please log in again');
 
-    // Step 4 — Send only the encrypted payload to our relay (plaintext never touches server)
+    // 4 — RSA-wrap enc_key for the recipient  (they use rsa_enc_key to decrypt)
+    const recipPubKey    = await importPublicKey(recipKeyData.key);
+    const rsa_enc_key    = await rsaEncrypt(ck.encryption_key, recipPubKey);
+
+    // 5 — RSA-wrap enc_key for ourselves      (we use sender_enc_key to read our own messages)
+    const sender_enc_key = await rsaEncrypt(ck.encryption_key, S.rsaPublicKey);
+
+    // 6 — Relay the encrypted payload (plaintext never reaches our server)
     const {ok, data} = await api('/msg/send', {
       method: 'POST',
       body:   JSON.stringify({
-        recipient:   S.activeContact.email,
-        ciphertext:  ck.ciphertext,
-        nonce:       ck.nonce,
-        rsa_enc_key: rsa_enc_key,
+        recipient:      S.activeContact.email,
+        ciphertext:     ck.ciphertext,
+        nonce:          ck.nonce,
+        rsa_enc_key,
+        sender_enc_key,
       }),
     });
 
@@ -1389,5 +1438,5 @@ except Exception as e:
 
 if __name__ == "__main__":
     log.info(f"BurnChat starting on port {PORT}")
-    log.info("Encryption: CLIENT-SIDE RSA-OAEP (browser) + ChaosKey AES-256-GCM (server-proxied).")
+    log.info("Encryption: CLIENT-SIDE RSA-OAEP dual-wrap (browser) + ChaosKey AES-256-GCM (server-proxied).")
     app.run(host="0.0.0.0", port=PORT, debug=False)
