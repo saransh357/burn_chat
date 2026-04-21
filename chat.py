@@ -980,6 +980,7 @@ async function deriveKeyFromPassword(password, email) {
 }
 
 async function genAndRegisterKeys(password, email) {
+  console.info('[BurnChat] genAndRegisterKeys: generating 2048-bit RSA-OAEP key pair…');
   const kp = await crypto.subtle.generateKey(
     {name:'RSA-OAEP', modulusLength:2048, publicExponent:new Uint8Array([1,0,1]), hash:'SHA-256'},
     true, ['encrypt','decrypt']
@@ -1000,16 +1001,27 @@ async function genAndRegisterKeys(password, email) {
   combined.set(iv);
   combined.set(new Uint8Array(encPriv), 12);
 
+  console.info('[BurnChat] genAndRegisterKeys: key pair generated and vault encrypted ✓');
   return {pubB64, encPrivB64: btoa(String.fromCharCode(...combined))};
 }
 
 async function loadPrivateKey(email) {
   const b64 = localStorage.getItem('bc_priv_' + email);
-  if (!b64) return null;
+  if (!b64) {
+    console.warn('[BurnChat] loadPrivateKey: no key in localStorage for', email);
+    return null;
+  }
   try {
     const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-    return await crypto.subtle.importKey('pkcs8', raw, {name:'RSA-OAEP', hash:'SHA-256'}, false, ['decrypt']);
-  } catch { return null; }
+    const key = await crypto.subtle.importKey('pkcs8', raw, {name:'RSA-OAEP', hash:'SHA-256'}, false, ['decrypt']);
+    console.info('[BurnChat] loadPrivateKey: key loaded from localStorage ✓');
+    return key;
+  } catch(e) {
+    console.error('[BurnChat] loadPrivateKey: failed to import key from localStorage —', e.name, e.message);
+    // Remove corrupted entry so re-login can replace it cleanly from the vault
+    localStorage.removeItem('bc_priv_' + email);
+    return null;
+  }
 }
 
 async function importPublicKey(pubB64) {
@@ -1025,7 +1037,10 @@ async function rsaEncrypt(plaintext, cryptoKey) {
 }
 
 async function rsaDecrypt(cipherB64) {
-  if (!S.rsaPrivateKey) return null;
+  if (!S.rsaPrivateKey) {
+    console.warn('[BurnChat] rsaDecrypt: called but S.rsaPrivateKey is null');
+    return null;
+  }
   try {
     const dec = await crypto.subtle.decrypt(
       {name:'RSA-OAEP'},
@@ -1033,7 +1048,12 @@ async function rsaDecrypt(cipherB64) {
       Uint8Array.from(atob(cipherB64), c => c.charCodeAt(0))
     );
     return new TextDecoder().decode(dec);
-  } catch { return null; }
+  } catch(e) {
+    // OperationError = tag mismatch → key in memory doesn't match the one used to wrap this ciphertext
+    console.error('[BurnChat] rsaDecrypt: unwrap failed —', e.name, '—', e.message,
+      '(key mismatch, wrong device, or corrupted ciphertext)');
+    return null;
+  }
 }
 
 /**
@@ -1047,7 +1067,7 @@ async function ensureOwnPublicKey() {
     const {data} = await api(`/user/key?email=${encodeURIComponent(S.me.email)}`);
     if (data.key) S.rsaPublicKey = await importPublicKey(data.key);
   } catch(e) {
-    console.warn('Could not load own public key:', e);
+    console.warn('[BurnChat] ensureOwnPublicKey: could not load own public key —', e.message);
   }
 }
 
@@ -1101,31 +1121,56 @@ async function doAuth() {
   S.me = {email: data.email, name: data.name, color: data.color};
 
   if (S.authMode === 'login') {
-    // Try localStorage first (same device)
+    // 1 — Try localStorage first (same device, fastest path)
     S.rsaPrivateKey = await loadPrivateKey(email);
 
-    // New device: decrypt the AES-encrypted vault to recover private key
-    if (!S.rsaPrivateKey && data.encrypted_private_key) {
-      try {
-        const combined = Uint8Array.from(atob(data.encrypted_private_key), c => c.charCodeAt(0));
-        const privRaw  = await crypto.subtle.decrypt(
-          {name:'AES-GCM', iv: combined.slice(0, 12)},
-          await deriveKeyFromPassword(pw, email),
-          combined.slice(12)
-        );
-        S.rsaPrivateKey = await crypto.subtle.importKey(
-          'pkcs8', privRaw, {name:'RSA-OAEP', hash:'SHA-256'}, false, ['decrypt']
-        );
-        localStorage.setItem('bc_priv_' + email, btoa(String.fromCharCode(...new Uint8Array(privRaw))));
-        toast('🔑 RSA keys synced from vault', 'ok', 4000);
-      } catch(e) {
-        toast('⚠ Could not decrypt key vault (wrong password?)', 'err', 5000);
+    // 2 — New/different device: attempt AES-256-GCM vault decryption
+    if (!S.rsaPrivateKey) {
+      if (!data.encrypted_private_key) {
+        // Account pre-dates the vault feature, or signup didn't complete the key step
+        console.warn('[BurnChat] vault: no encrypted_private_key on server record — ' +
+          'account may pre-date vault feature or signup did not complete');
+        toast('⚠ No key vault found on server. Messages cannot be decrypted on this device.', 'err', 7000);
+      } else {
+        try {
+          console.info('[BurnChat] vault: attempting AES-GCM vault decryption…');
+          const combined = Uint8Array.from(atob(data.encrypted_private_key), c => c.charCodeAt(0));
+          if (combined.length < 13) {
+            throw new Error('Vault blob too short — likely corrupted (length=' + combined.length + ')');
+          }
+          const aesKey  = await deriveKeyFromPassword(pw, email);
+          const privRaw = await crypto.subtle.decrypt(
+            {name:'AES-GCM', iv: combined.slice(0, 12)},
+            aesKey,
+            combined.slice(12)
+          );
+          S.rsaPrivateKey = await crypto.subtle.importKey(
+            'pkcs8', privRaw, {name:'RSA-OAEP', hash:'SHA-256'}, false, ['decrypt']
+          );
+          localStorage.setItem('bc_priv_' + email, btoa(String.fromCharCode(...new Uint8Array(privRaw))));
+          console.info('[BurnChat] vault: RSA private key recovered and cached in localStorage ✓');
+          toast('🔑 RSA keys synced from vault', 'ok', 4000);
+        } catch(e) {
+          // DOMException OperationError = AES-GCM tag mismatch → almost always a wrong password
+          const hint = (e.name === 'OperationError')
+            ? 'Wrong password or corrupted vault'
+            : (e.message || e.name || 'Unknown error');
+          console.error('[BurnChat] vault: decryption failed —', e.name, '—', e.message, e);
+          toast(`⚠ Key vault error: ${hint}. You will not be able to decrypt messages on this device.`, 'err', 8000);
+        }
       }
     }
 
-    // Import own public key from server response so we can self-wrap enc_keys at send time
+    // 3 — Import own public key from server so we can self-wrap enc_keys at send time
     if (data.public_key) {
-      try { S.rsaPublicKey = await importPublicKey(data.public_key); } catch {}
+      try {
+        S.rsaPublicKey = await importPublicKey(data.public_key);
+        console.info('[BurnChat] login: own RSA public key imported ✓');
+      } catch(e) {
+        console.error('[BurnChat] login: failed to import own public key —', e.name, e.message);
+      }
+    } else {
+      console.warn('[BurnChat] login: server returned no public_key for this account');
     }
   }
 
@@ -1144,7 +1189,14 @@ async function checkSession() {
     S.me = {email: data.email, name: data.name, color: data.color};
     S.rsaPrivateKey = await loadPrivateKey(data.email);
     if (data.public_key) {
-      try { S.rsaPublicKey = await importPublicKey(data.public_key); } catch {}
+      try {
+        S.rsaPublicKey = await importPublicKey(data.public_key);
+        console.info('[BurnChat] checkSession: own RSA public key imported ✓');
+      } catch(e) {
+        console.error('[BurnChat] checkSession: failed to import own public key —', e.name, e.message);
+      }
+    } else {
+      console.warn('[BurnChat] checkSession: server returned no public_key for this account');
     }
     enterApp(data);
   }
