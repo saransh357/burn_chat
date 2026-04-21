@@ -448,6 +448,39 @@ def update_public_key():
     return jsonify({"ok": True})
 
 
+@app.route("/auth/rekey", methods=["POST"])
+@require_login
+def rekey():
+    """
+    Replace both RSA keys for the logged-in user.
+    Called when a user has no vault on the server (account pre-dates the feature,
+    or signup didn't complete the key step). The browser generates a fresh keypair,
+    AES-encrypts the private key with the user's password, and sends us only the
+    public key + encrypted vault — we never see the private key or the password.
+    Requires current password to prevent a rogue session from silently rotating keys.
+    """
+    body      = request.get_json(force=True) or {}
+    pw        = body.get("password", "").strip()
+    pub       = body.get("public_key", "").strip()
+    enc_priv  = body.get("encrypted_private_key", "").strip()
+
+    if not pw or not pub or not enc_priv:
+        return jsonify({"error": "password, public_key, and encrypted_private_key are required"}), 400
+
+    user = db_exec("SELECT password_hash FROM users WHERE email = ?",
+                   (session["user_email"],)).fetchone()
+    if not user or not check_password(pw, user["password_hash"]):
+        return jsonify({"error": "Incorrect password"}), 403
+
+    db_exec(
+        "UPDATE users SET public_key = ?, encrypted_private_key = ? WHERE email = ?",
+        (pub, enc_priv, session["user_email"])
+    )
+    db_commit()
+    log.info(f"Re-key completed for {session['user_email']}")
+    return jsonify({"ok": True})
+
+
 # ── Message routes ────────────────────────────────────────────────────────────
 @app.route("/msg/send", methods=["POST"])
 @require_login
@@ -894,6 +927,31 @@ body{background:var(--void);color:var(--paper);font-family:'Syne',sans-serif;hei
   </div>
 </div>
 
+<!-- Re-key modal — shown when account has no vault on server -->
+<div class="modal-overlay" id="rekey-modal">
+  <div class="modal">
+    <div class="modal-icon">🔑</div>
+    <h2>Generate new keys</h2>
+    <p>No key vault was found for this account. Enter your password to generate a fresh RSA keypair and upload an encrypted vault — you'll be able to decrypt messages going forward.</p>
+    <div style="margin:1rem 0">
+      <input id="rekey-pw-input" type="password" placeholder="Your current password"
+        style="width:100%;padding:.75rem 1rem;background:var(--ash);border:1px solid var(--smoke);border-radius:8px;color:var(--snow);font-family:'Syne',sans-serif;font-size:.88rem;outline:none"
+        onfocus="this.style.borderColor='var(--ember)'" onblur="this.style.borderColor='var(--smoke)'"
+        onkeydown="if(event.key==='Enter')executeRekey()">
+      <div id="rekey-modal-err" style="font-family:'Fira Code',monospace;font-size:.72rem;color:#ff8fab;min-height:1.1rem;margin-top:.4rem"></div>
+      <div style="font-family:'Fira Code',monospace;font-size:.63rem;color:var(--fog);margin-top:.5rem;line-height:1.5">
+        ⚠ Old messages encrypted to your previous key cannot be recovered. New messages will work normally.
+      </div>
+    </div>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeRekeyModal()">Later</button>
+      <button class="modal-confirm" id="rekey-confirm-btn"
+        style="background:linear-gradient(135deg,var(--ember),var(--flame));box-shadow:0 4px 15px rgba(255,107,53,.3)"
+        onclick="executeRekey()">Generate keys</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1130,7 +1188,8 @@ async function doAuth() {
         // Account pre-dates the vault feature, or signup didn't complete the key step
         console.warn('[BurnChat] vault: no encrypted_private_key on server record — ' +
           'account may pre-date vault feature or signup did not complete');
-        toast('⚠ No key vault found on server. Messages cannot be decrypted on this device.', 'err', 7000);
+        // Offer to generate a fresh keypair rather than leaving the user locked out
+        showRekeyModal();
       } else {
         try {
           console.info('[BurnChat] vault: attempting AES-GCM vault decryption…');
@@ -1466,6 +1525,71 @@ async function saveUpdatedKey() {
     toast('⚿ ChaosKey API key updated', 'ok');
   } else {
     errEl.textContent = '⚠ ' + (data.error || 'Update failed');
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Re-key flow — generate fresh RSA keypair when vault is missing
+// ════════════════════════════════════════════════════════════════
+function showRekeyModal() {
+  $('rekey-modal-err').textContent = '';
+  $('rekey-pw-input').value = '';
+  $('rekey-modal').classList.add('open');
+  // Pre-fill password if user just typed it during login (field still populated)
+  const loginPw = $('f-pw') ? $('f-pw').value : '';
+  if (loginPw) $('rekey-pw-input').value = loginPw;
+  setTimeout(() => $('rekey-pw-input').focus(), 150);
+}
+
+function closeRekeyModal() {
+  $('rekey-modal').classList.remove('open');
+  $('rekey-modal-err').textContent = '';
+  $('rekey-pw-input').value = '';
+}
+
+async function executeRekey() {
+  const pw    = $('rekey-pw-input').value;
+  const errEl = $('rekey-modal-err');
+  const btn   = $('rekey-confirm-btn');
+
+  if (!pw) { errEl.textContent = '⚠ Password required'; return; }
+  if (!S.me) { errEl.textContent = '⚠ Not logged in'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  errEl.textContent = '';
+
+  try {
+    console.info('[BurnChat] rekey: generating fresh RSA-OAEP keypair…');
+    const {pubB64, encPrivB64} = await genAndRegisterKeys(pw, S.me.email);
+    // S.rsaPublicKey + S.rsaPrivateKey are now set by genAndRegisterKeys
+
+    const {ok, data} = await api('/auth/rekey', {
+      method: 'POST',
+      body:   JSON.stringify({
+        password:              pw,
+        public_key:            pubB64,
+        encrypted_private_key: encPrivB64,
+      }),
+    });
+
+    if (!ok) {
+      const msg = data.error || 'Re-key failed';
+      console.error('[BurnChat] rekey: server rejected —', msg);
+      errEl.textContent = '⚠ ' + msg;
+      return;
+    }
+
+    console.info('[BurnChat] rekey: new keys uploaded ✓');
+    closeRekeyModal();
+    $('e2ee-status').style.display = 'flex';
+    toast('🔑 New RSA keys generated and saved', 'ok', 5000);
+  } catch(e) {
+    console.error('[BurnChat] rekey: error —', e.name, e.message, e);
+    errEl.textContent = '⚠ ' + (e.message || 'Unknown error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate keys';
   }
 }
 
