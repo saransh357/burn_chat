@@ -1,5 +1,5 @@
 """
-BurnChat — Encrypted Ephemeral Messenger 
+BurnChat — Encrypted Ephemeral Messenger (Speed Edition)
 ======================================================================
 Speed improvements over previous version:
 
@@ -983,6 +983,11 @@ const S = {
 // Decryption cache — keyed by message id, survives polls
 const decCache = new Map();
 
+// Rendered message IDs — the single source of truth for dedup.
+// Updated BEFORE async decryption so concurrent poll calls can never
+// double-render the same message id.  Cleared on thread switch / burn.
+const renderedIds = new Set();
+
 // Public key cache — imported CryptoKey objects, keyed by email
 const pubKeyCache = new Map();
 
@@ -1461,8 +1466,9 @@ function openThread(email, name, color) {
   // Prefetch contact key (likely already cached from inbox bulk-load)
   prefetchContactKey(email);
 
-  // Reset incremental cursor for this thread so we do a full first load
-  if (!S.lastMsgId[email]) S.lastMsgId[email] = 0;
+  // Reset incremental cursor and rendered-id guard for this thread
+  S.lastMsgId[email] = 0;
+  renderedIds.clear();
 
   // If switching threads, clear the area so old messages don't flash
   const area = $('messages-area');
@@ -1490,15 +1496,27 @@ async function loadThread(email, scrollToBottom=false) {
   const since = S.lastMsgId[email] || 0;
   const {ok, data} = await api(`/msg/thread?with=${encodeURIComponent(email)}&since=${since}`);
   if (!ok || !Array.isArray(data)) return;
-  if (!data.length) return;  // nothing new — fast exit
 
-  // Update cursor to highest id seen
+  // ── DEDUP: drop any id we've already rendered ────────────────
+  // This is the single guard against duplicate bubbles regardless
+  // of whether the poll, a send, or a vault-unlock triggers the call.
+  const newMsgs = data.filter(m => !renderedIds.has(m.id));
+  if (!newMsgs.length) return;
+
+  // ── Update cursor BEFORE async work ─────────────────────────
+  // Any concurrent poll that starts now will use the new cursor,
+  // so it won't fetch these same ids again.
   const maxId = Math.max(...data.map(m => m.id));
-  S.lastMsgId[email] = maxId;
+  if (maxId > (S.lastMsgId[email] || 0)) S.lastMsgId[email] = maxId;
 
-  // Decrypt only new messages, in parallel
-  const resolved = await Promise.all(data.map(async m => {
-    if (decCache.has(m.id)) return {id:m.id, from: m.from, sent_at: m.sent_at, text: decCache.get(m.id)};
+  // ── Mark ids as rendered BEFORE decryption ───────────────────
+  // If two loadThread calls overlap in the await below, the second
+  // will find these ids in renderedIds and return early (newMsgs=[]).
+  newMsgs.forEach(m => renderedIds.add(m.id));
+
+  // ── Decrypt in parallel ──────────────────────────────────────
+  const resolved = await Promise.all(newMsgs.map(async m => {
+    if (decCache.has(m.id)) return {id: m.id, from: m.from, sent_at: m.sent_at, text: decCache.get(m.id)};
 
     let text = '[Decryption failed]';
     if (!S.rsaPrivateKey) {
@@ -1531,21 +1549,26 @@ async function loadThread(email, scrollToBottom=false) {
   }));
 
   const area = $('messages-area');
-  // Guard: user might have switched threads while we were awaiting
   if (area.dataset.contact !== email) return;
 
   for (const m of resolved) {
-    // Remove matching optimistic bubble (same text, from me, within last 10s)
-    if (m.from === S.me.email) {
-      const optEl = area.querySelector(`.optimistic[data-text="${CSS.escape(m.text)}"]`);
-      if (optEl) { optEl.remove(); continue; }
+    // If there's a pending (optimistic) bubble for this exact id, confirm it
+    // in place rather than appending a second bubble.
+    const pendingEl = area.querySelector(`[data-pending="${m.id}"]`);
+    if (pendingEl) {
+      pendingEl.removeAttribute('data-pending');
+      pendingEl.classList.remove('optimistic');
+      pendingEl.querySelector('.msg-meta').textContent = fmtTime(m.sent_at);
+      pendingEl.querySelector('.e2ee-tag').textContent = '⚿ ChaosKey + RSA-OAEP';
+      continue;
     }
+
     const mine = m.from === S.me.email;
     const isErr = m.text.startsWith('[');
     const el = document.createElement('div');
-    el.className = `msg-group ${mine?'mine':'theirs'}`;
+    el.className = `msg-group ${mine ? 'mine' : 'theirs'}`;
     el.innerHTML = `
-      <div class="bubble${isErr?' err-bubble':''}">${esc(m.text)}</div>
+      <div class="bubble${isErr ? ' err-bubble' : ''}">${esc(m.text)}</div>
       <div class="msg-meta">${fmtTime(m.sent_at)}</div>
       <div class="e2ee-tag">⚿ ChaosKey + RSA-OAEP</div>`;
     area.appendChild(el);
