@@ -1,5 +1,5 @@
 """
-BurnChat — Encrypted Ephemeral Messenger (Ultra-Fast Edition)
+BurnChat — Encrypted Ephemeral Messenger 
 ======================================================================
 Performance improvements over Speed Edition:
 
