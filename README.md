@@ -21,7 +21,7 @@ burnchat/
 │   ├── messages.py              # /msg/* — send, thread, inbox, burn, search
 │   └── misc.py                   # /health, / (index page)
 ├── templates/
-│   └── index.html                # page markup (was an inline HTML string)
+│   └── index.html                # page markup 
 ├── static/
 │   ├── css/style.css               # was an inline <style> block
 │   └── js/app.js                    # was an inline <script> block
