@@ -1,4 +1,4 @@
-# BurnChat — split into modules
+# BurnChat  split 
 
 Originally a single 2k line `app.py` with the entire backend, HTML,
 CSS, and JS embedded as a Python string. Same behavior, same routes,
