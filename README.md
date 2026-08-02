@@ -1,8 +1,8 @@
 # BurnChat — split into modules
 
-Originally a single ~1,700-line `app.py` with the entire backend, HTML,
+Originally a single 2k line `app.py` with the entire backend, HTML,
 CSS, and JS embedded as a Python string. Same behavior, same routes,
-same DB schema — just organized so each concern lives in its own file.
+same DB schema  just organized so each concern lives in its own file.
 
 ## Layout
 
@@ -40,12 +40,3 @@ Set `DATABASE_URL` to use Postgres instead of SQLite, `SECRET_KEY` to
 pin the Flask session signing key (**do this before deploying** — see
 SECURITY.md item 7), and `CHAOSKEY_URL`/`PORT` as needed.
 
-## What changed vs. the original file, functionally
-
-Nothing — every route, query, and script behaves identically. This was
-a structural refactor only: extracting the HTML/CSS/JS out of an inline
-`HTML = r"""..."""` string into real template/static files (rendered
-via `render_template` + `url_for('static', ...)` instead of
-`render_template_string`), and splitting the backend by responsibility
-into importable modules. See SECURITY.md for an actual security
-assessment of the app's design, independent of this refactor.
