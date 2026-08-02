@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BurnChat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Fira+Code:wght@300;400;500&family=Lora:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div id="auth">
+  <div class="auth-bg"></div>
+  <div class="auth-card">
+    <div class="auth-wordmark">
+      <div class="burn-icon">🔥</div>
+      <div class="wordmark-text">
+        <h1>BurnChat</h1>
+        <p>RSA-OAEP · AES-256-GCM · CROSS-DEVICE E2EE</p>
+      </div>
+    </div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-in" onclick="switchAuthTab('login')">Sign in</button>
+      <button class="auth-tab" id="tab-up" onclick="switchAuthTab('signup')">Create account</button>
+    </div>
+    <div id="field-name" class="form-field" style="display:none">
+      <label>Display name</label>
+      <input id="f-name" type="text" placeholder="How should people know you?" autocomplete="name">
+    </div>
+    <div class="form-field">
+      <label>Email</label>
+      <input id="f-email" type="email" placeholder="you@example.com" autocomplete="email">
+    </div>
+    <div class="form-field">
+      <label>Password</label>
+      <input id="f-pw" type="password" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <div id="field-ck-key" class="form-field" style="display:none">
+      <label>ChaosKey API key</label>
+      <input id="f-ck-key" type="text" placeholder="ck_live_…" autocomplete="off" spellcheck="false"
+        style="font-family:'Fira Code',monospace;font-size:.8rem">
+      <div class="form-hint">Register on ChaosKey → copy your <code style="color:var(--ember)">ck_live_…</code> key</div>
+    </div>
+    <button class="auth-submit" id="auth-btn" onclick="doAuth()">Sign in →</button>
+    <div class="auth-err" id="auth-err"></div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <div class="sidebar">
+    <div class="sidebar-top">
+      <div class="user-row">
+        <div class="user-chip">
+          <div class="avatar" id="my-avatar" style="background:#ff6b35">U</div>
+          <div class="user-meta">
+            <div class="uname" id="my-name">–</div>
+            <div class="uemail" id="my-email">–</div>
+          </div>
+        </div>
+        <button class="logout-btn" onclick="doLogout()">exit</button>
+      </div>
+      <div class="status-bar" id="status-bar"></div>
+      <div class="search-wrap">
+        <span class="search-icon">⌕</span>
+        <input id="search-input" type="email" placeholder="Find user by email…"
+          oninput="onSearchInput(this.value)"
+          onblur="setTimeout(()=>closeSearch(),150)">
+        <div class="search-results" id="search-results"></div>
+      </div>
+    </div>
+    <div class="sidebar-label">Conversations</div>
+    <div class="thread-list" id="thread-list">
+      <div class="no-threads">Search for a user above<br>to start a conversation.</div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="empty-state" id="empty-state">
+      <div class="es-icon">🔥</div>
+      <div class="es-title">Select a conversation</div>
+      <div class="es-sub">End-to-end encrypted · RSA-OAEP + ChaosKey AES-256-GCM<br>Works across all your devices</div>
+    </div>
+    <div class="chat-view" id="chat-view">
+      <div class="chat-header">
+        <div class="chat-header-left">
+          <div class="avatar" id="contact-avatar" style="background:#888">C</div>
+          <div class="contact-info">
+            <div class="cname" id="contact-name">–</div>
+            <div class="cemail" id="contact-email">–</div>
+          </div>
+          <div class="enc-badge">⚿ E2EE</div>
+        </div>
+        <button class="burn-thread-btn" onclick="confirmBurn()">🔥 Burn thread</button>
+      </div>
+      <div class="messages" id="messages-area"></div>
+      <div class="compose">
+        <div class="compose-wrap">
+          <textarea class="compose-input" id="compose-input" rows="1"
+            placeholder="Write an encrypted message… (Enter to send)"
+            oninput="onComposeInput(this)"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
+          <div class="spec-indicator" id="spec-indicator">⚿ encrypted and ready</div>
+        </div>
+        <button class="send-btn" id="send-btn" onclick="sendMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Burn thread modal -->
+<div class="modal-overlay" id="burn-modal">
+  <div class="modal">
+    <div class="modal-icon">🔥</div>
+    <h2>Burn this thread?</h2>
+    <p id="burn-modal-text">This will permanently delete all messages.</p>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeMod('burn-modal')">Cancel</button>
+      <button class="modal-confirm modal-confirm-danger" onclick="executeBurn()">Burn it</button>
+    </div>
+  </div>
+</div>
+
+<!-- Update ChaosKey -->
+<div class="modal-overlay" id="key-modal">
+  <div class="modal">
+    <div class="modal-icon">⚿</div>
+    <h2>Update ChaosKey API key</h2>
+    <p>Paste a fresh <code style="font-family:'Fira Code',monospace;color:var(--ember)">ck_live_…</code> key.</p>
+    <input id="modal-ck-input" class="modal-input" type="text" placeholder="ck_live_…"
+      onkeydown="if(event.key==='Enter')saveUpdatedKey()">
+    <div class="modal-err" id="key-modal-err"></div>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeMod('key-modal')">Cancel</button>
+      <button class="modal-confirm" onclick="saveUpdatedKey()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Re-key -->
+<div class="modal-overlay" id="rekey-modal">
+  <div class="modal">
+    <div class="modal-icon">🔑</div>
+    <h2 id="rekey-modal-title">Generate new keys</h2>
+    <p id="rekey-modal-desc">Enter your password to generate a fresh RSA keypair.</p>
+    <input id="rekey-pw-input" class="modal-input" type="password" placeholder="Your current password"
+      onkeydown="if(event.key==='Enter')executeRekey()">
+    <div class="modal-err" id="rekey-modal-err"></div>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeMod('rekey-modal')">Later</button>
+      <button class="modal-confirm" id="rekey-confirm-btn" onclick="executeRekey()">Generate keys</button>
+    </div>
+  </div>
+</div>
+
+<!-- Vault decrypt -->
+<div class="modal-overlay" id="vault-pw-modal">
+  <div class="modal">
+    <div class="modal-icon">🔐</div>
+    <h2>Enter password to unlock vault</h2>
+    <p>Your encrypted key vault was found but couldn't be unlocked automatically. Enter your password to decrypt it on this device.</p>
+    <input id="vault-pw-input" class="modal-input" type="password" placeholder="Your password"
+      onkeydown="if(event.key==='Enter')executeVaultDecrypt()">
+    <div class="modal-err" id="vault-pw-err"></div>
+    <div class="modal-btns">
+      <button class="modal-cancel" onclick="closeMod('vault-pw-modal');showRekeyModal('failed')">Generate new keys instead</button>
+      <button class="modal-confirm" id="vault-pw-btn" onclick="executeVaultDecrypt()">Unlock</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
